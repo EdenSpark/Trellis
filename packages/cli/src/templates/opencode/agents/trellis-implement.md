@@ -2,14 +2,13 @@
 description: |
   Code implementation expert. Understands specs and requirements, then implements features. No git commit allowed.
 mode: subagent
-permission:
-  read: allow
-  write: allow
-  edit: allow
-  bash: allow
-  glob: allow
-  grep: allow
-  mcp__exa__*: allow
+permissions:
+  - { action: read, resource: "*", effect: allow }
+  - { action: edit, resource: "*", effect: allow }
+  - { action: shell, resource: "*", effect: allow }
+  - { action: glob, resource: "*", effect: allow }
+  - { action: grep, resource: "*", effect: allow }
+  - { action: "exa_*", resource: "*", effect: allow }
 ---
 # Implement Agent
 

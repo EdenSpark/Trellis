@@ -574,10 +574,12 @@ exports session identity in its environment or the command is launched with
 how to provide a session runtime. For Claude Code, SessionStart receives
 `CLAUDE_ENV_FILE`; Trellis must append `export TRELLIS_CONTEXT_ID=<context-key>`
 there so later Bash tools inherit the same session identity. For OpenCode,
-`tool.execute.before` must prefix Bash commands with
+the v2 `tool` `execute.before` hook must prefix shell tool commands with
 `TRELLIS_CONTEXT_ID` from plugin session identity when the command does not
 already set it, because OpenCode exports no session identity into a
-shell child at all. The prefix must match the host shell: use
+shell child at all. (The hook is registered on `tool` `execute.before`
+rather than `shell` `create.before` because the former's event carries
+`sessionID`/`agent` and the latter's does not.) The prefix must match the host shell: use
 `export TRELLIS_CONTEXT_ID=<context-key>;` for POSIX shells and
 `$env:TRELLIS_CONTEXT_ID = '<context-key>';` for Windows PowerShell. Keep the
 assignment before the user's command so compound commands like

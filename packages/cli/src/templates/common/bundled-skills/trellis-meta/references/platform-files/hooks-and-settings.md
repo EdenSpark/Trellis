@@ -19,7 +19,7 @@ Common files:
 | Claude Code | `.claude/settings.json` |
 | Cursor | `.cursor/hooks.json` |
 | Codex | `.codex/hooks.json`, `.codex/config.toml` |
-| OpenCode | `.opencode/package.json`, `.opencode/plugins/*` |
+| OpenCode | `.opencode/plugins/*` (v2 plugin API; Trellis ships no `.opencode/package.json` — OpenCode v2 does not read it) |
 | Kiro | `.kiro/hooks/` + platform config |
 | Gemini CLI | `.gemini/settings.json` |
 | Qoder | `.qoder/settings.json` |

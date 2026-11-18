@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/cli/backend/platform-integration.md", "reason": "opencode 平台模板/配置器约定，插件与模板改动的直接规范"}
+{"file": ".trellis/spec/cli/backend/configurator-shared.md", "reason": "configurators/shared.ts 共享 helper 约定，opencode.ts 依赖"}
+{"file": ".trellis/spec/core/backend/index.md", "reason": "core 层入口规范，mem 适配器所在层"}
+{"file": ".trellis/spec/cli/unit-test/conventions.md", "reason": "模板测试改写规范"}
+{"file": ".trellis/tasks/11-18-opencode-v2-adaptation/research/opencode-v2-plugin-api.md", "reason": "v2 插件 API 事实与 hook 对照表，插件重写依据"}
+{"file": ".trellis/tasks/11-18-opencode-v2-adaptation/research/opencode-v2-session-storage.md", "reason": "v2 存储 schema 与 turn 抽取规则，mem 适配器重建依据"}
+{"file": ".trellis/tasks/11-18-opencode-v2-adaptation/research/opencode-v2-config-and-conventions.md", "reason": "v2 frontmatter 映射与版本检测事实，agent 模板迁移依据"}

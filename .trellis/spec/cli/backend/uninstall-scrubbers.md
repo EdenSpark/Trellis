@@ -16,7 +16,7 @@ Most files Trellis writes are opaque (`.py`, `.md`, `.ts`) — `trellis uninstal
 |------|----------------|
 | `.claude/settings.json` | Trellis writes the `hooks` block and may opt in its status-line command; user may have set `env`, `model`, `permissions`, `version`, or another status line |
 | `.cursor/hooks.json` | Same idea, but a flat schema |
-| `.opencode/package.json` | Trellis adds `dependencies["@opencode-ai/plugin"]`; user may have other deps |
+| `.opencode/package.json` | Legacy v1-era artifact: Trellis used to add the OpenCode plugin npm dependency (the `@opencode-ai` scope's `plugin` package); current v2 templates ship no `.opencode/package.json` at all (v2 does not read it), so this only exists in pre-v2 installs. User may have other deps |
 | `.pi/settings.json` | Trellis adds `enableSkillCommands` plus entries in `extensions`/`skills`/`prompts` arrays; user may have entries of their own |
 | `.codex/config.toml` | Trellis writes documented fallback/hook settings, template comments, and `[agents].max_depth = 1`; user may have added more TOML directives or other `[agents]` keys |
 | `.codex/hooks.json`, `.gemini/settings.json`, `.factory/settings.json`, `.codebuddy/settings.json`, `.qoder/settings.json`, `.github/copilot/hooks.json` | Same hooks-block pattern as `.claude/settings.json` (sometimes flat, sometimes nested) |
@@ -120,11 +120,13 @@ This rule assumes the Trellis-emitted shape:
 
 Scrubs `.opencode/package.json`:
 
-1. Delete `dependencies["@opencode-ai/plugin"]`.
+1. Delete the v1-era OpenCode plugin dependency from `dependencies` (the `@opencode-ai` scope's `plugin` package).
 2. If `dependencies` ends up empty → drop the field.
 3. `fullyEmpty` iff the resulting root object has no keys.
 
 This is the simplest scrubber: only one field to touch, and the rest of `package.json` (name, version, scripts, devDeps, …) is user-owned.
+
+Current v2 templates ship no `.opencode/package.json` (OpenCode v2 does not read it; plugins import only Node built-ins plus the sibling `lib/` modules). This scrubber remains so `trellis uninstall` still cleans up installs written by pre-v2 Trellis versions.
 
 ### `utils/uninstall-scrubbers.ts:scrubPiSettings`
 
@@ -173,7 +175,7 @@ Scrubbers identify Trellis content via three distinct mechanisms — there is no
 | Mechanism | Used by | Example |
 |-----------|---------|---------|
 | **Last-token path match** against `deletedPaths` | `scrubHooksJson` | Hook entry with `command = "python3 .claude/hooks/session-start.py"` matches because the trailing token is in the delete-set |
-| **Exact string match** against hard-coded constants | `scrubOpencodePackageJson`, `scrubPiSettings` | `"./skills"` in a Pi `skills` array, `"@opencode-ai/plugin"` as a dep key |
+| **Exact string match** against hard-coded constants | `scrubOpencodePackageJson`, `scrubPiSettings` | `"./skills"` in a Pi `skills` array, the legacy OpenCode plugin dep key |
 | **Current-template-derived + legacy comment allowlists**, exact table assignment, and fallback assignment regex | `scrubCodexConfigToml` | Current/legacy Trellis comment lines, `[agents].max_depth = 1`, and `project_doc_fallback_filenames` |
 
 ### Why no "BEGIN TRELLIS / END TRELLIS" comment markers?

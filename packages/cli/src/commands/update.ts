@@ -61,6 +61,7 @@ import {
 import { replacePythonCommandLiterals } from "../configurators/shared.js";
 import { preserveCodexAgentModelKeys } from "../configurators/codex.js";
 import { printZcodeSetupHint } from "../configurators/zcode.js";
+import { warnIfOpenCodeBelowV2 } from "../configurators/opencode.js";
 import { ensureGitattributes } from "../configurators/workflow.js";
 import { pruneOrphanManifestKeys } from "../utils/manifest-prune.js";
 import {
@@ -917,6 +918,11 @@ async function collectTemplateFiles(
           COPILOT_INSTRUCTIONS_PATH,
           buildCopilotInstructionsTemplate(cwd),
         );
+      }
+      if (platformId === "opencode") {
+        // R7: best-effort v2 gate alongside the template refresh — silent
+        // unless an OpenCode 1.x binary is actually installed.
+        warnIfOpenCodeBelowV2();
       }
     }
   }

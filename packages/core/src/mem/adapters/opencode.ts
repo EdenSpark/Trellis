@@ -1,15 +1,39 @@
 /**
- * OpenCode 1.2+ persisted-session reader.
+ * OpenCode persisted-session reader (v1 + v2 stores).
  *
  * OpenCode stores sessions in a WAL-mode SQLite database under its XDG data
- * dir (see `internal/paths.ts:opencodeDbPath`). The three tables this adapter
- * reads, confirmed against a live 1.18 store:
+ * dir (see `internal/paths.ts:opencodeDbPath`). Two schema generations share
+ * that one file; which one is live is detected by table presence in
+ * `sqlite_master`.
+ *
+ * v1 (OpenCode 1.x), confirmed against a live 1.18 store:
  *
  *   - `session`  — id / parent_id (sub-agent chain) / title / directory
  *                  (workspace cwd) / time_created / time_updated
  *   - `message`  — id / session_id / time_created / data (JSON: {role, ...})
  *   - `part`     — message_id / session_id / time_created /
  *                  data (JSON: {type: "text"|"tool"|"reasoning"|..., ...})
+ *
+ * v2 (OpenCode 2.x), confirmed against the 2.x source (`session/sql.ts`,
+ * `schema/session-message.ts`):
+ *
+ *   - `session_v2`     — id / project_id / parent_id / directory / title /
+ *                        time_created / time_updated / ...
+ *   - `session_message`— id / session_id / type (discriminated union:
+ *                        user / assistant / compaction / system / synthetic /
+ *                        skill / shell / idle / *-switched) / seq (monotonic
+ *                        per session, unique with session_id) / data (JSON;
+ *                        user text in `data.text`, assistant text in
+ *                        `data.content[]` elements of type "text", completed
+ *                        compactions carry `data.summary`)
+ *   - `session_part`   — (message_id, ordinal) expansion of assistant
+ *                        `content[]`; redundant for dialogue extraction and
+ *                        not read here
+ *   - `kv`             — v1→v2 migration state under MIGRATION_STATE_KEY;
+ *                        while its phase is not "completed" the v1 tables may
+ *                        still hold sessions the importer has not copied, so
+ *                        both generations are read and de-duplicated by
+ *                        session id (the v2 copy wins)
  *
  * SQLite access is via the zero-dependency parser in
  * `internal/sqlite-readonly.ts`. A `better-sqlite3`-backed reader shipped in
@@ -112,7 +136,51 @@ type ReadOnlyDb = Parameters<
   typeof findTable
 >[0];
 
-// ---------- message / part store ----------
+// ---------- schema version detection ----------
+
+const SESSION_V2_TABLE = "session_v2";
+const SESSION_MESSAGE_TABLE = "session_message";
+const KV_TABLE = "kv";
+
+/** Key under which OpenCode 2.x records v1→v2 import progress in `kv`, as a
+ * JSON value like `{"phase":"sessions","cursor":...}` / `{"phase":"completed"}`. */
+const MIGRATION_STATE_KEY = "migration.v1-v2";
+
+interface OpencodeSchemaShape {
+  /** `session_v2` exists: this is a v2 store and new sessions land there. */
+  v2: boolean;
+  /** The v1→v2 import is unfinished, so the v1 tables may still hold
+   * sessions that only exist there. Both generations must be read. */
+  v1Pending: boolean;
+}
+
+/** The import is finished only when the kv marker says so; a missing kv table
+ * or key is read conservatively as "possibly incomplete" — reading the
+ * leftover v1 tables too is cheap and the id de-dup makes it harmless. */
+function migrationCompleted(
+  db: ReadOnlyDb,
+  names: ReadonlySet<string>,
+): boolean {
+  if (!names.has(KV_TABLE)) return false;
+  const rows = db.scanTable(KV_TABLE, (row) => row.key === MIGRATION_STATE_KEY);
+  for (const row of rows) {
+    const value = parseDataJson(row.value);
+    if (value?.phase === "completed") return true;
+  }
+  return false;
+}
+
+function detectSchemaShape(db: ReadOnlyDb): OpencodeSchemaShape {
+  const names = new Set(db.listTables().map((table) => table.name));
+  if (!names.has(SESSION_V2_TABLE)) return { v2: false, v1Pending: false };
+  const v1Present =
+    names.has(SESSION_TABLE) &&
+    names.has(MESSAGE_TABLE) &&
+    names.has(PART_TABLE);
+  return { v2: true, v1Pending: v1Present && !migrationCompleted(db, names) };
+}
+
+// ---------- message / part store (v1) ----------
 
 interface OpencodeMessageRow {
   id: string;
@@ -136,10 +204,6 @@ interface OpencodePartRow {
 interface OpencodeSessionStore {
   messagesBySession: Map<string, OpencodeMessageRow[]>;
   partsByMsg: Map<string, OpencodePartRow[]>;
-}
-
-function emptySessionStore(): OpencodeSessionStore {
-  return { messagesBySession: new Map(), partsByMsg: new Map() };
 }
 
 /** Scan position breaks ties so rows written in the same millisecond still
@@ -241,21 +305,126 @@ function scanMessagesAndParts(
   return buildSessionStore(messages, parts);
 }
 
+// ---------- message store (v2) ----------
+
+interface OpencodeV2MessageRow {
+  id: string;
+  /** Per-session monotonic order; `(session_id, seq)` is unique in v2, so it
+   * orders the timeline where v1 needed time_created + scan position. */
+  seq: number;
+  type: string;
+  data: Record<string, unknown>;
+}
+
+/** Ids present in `session_v2`, optionally narrowed to one session. Extract
+ * uses membership to decide whether a session id is v2-authoritative. */
+function scanV2SessionIds(
+  db: ReadOnlyDb,
+  sessionId: string | undefined,
+): Set<string> {
+  const table = findTable(db, SESSION_V2_TABLE);
+  requireColumns(table, ["id"]);
+  const rows =
+    sessionId === undefined
+      ? db.scanTable(SESSION_V2_TABLE)
+      : db.scanTable(SESSION_V2_TABLE, (row) => row.id === sessionId);
+  const ids = new Set<string>();
+  for (const row of rows) {
+    if (typeof row.id === "string") ids.add(row.id);
+  }
+  return ids;
+}
+
+/** Validate `session_message` and return its rows grouped by session, sorted
+ * by `seq`. `session_part` is deliberately not read: `session_message.data`
+ * already carries the full assistant `content[]`. */
+function scanV2Messages(
+  db: ReadOnlyDb,
+  sessionId: string | undefined,
+): Map<string, OpencodeV2MessageRow[]> {
+  const table = findTable(db, SESSION_MESSAGE_TABLE);
+  requireColumns(table, ["id", "session_id", "type", "seq", "data"]);
+  const rows =
+    sessionId === undefined
+      ? db.scanTable(SESSION_MESSAGE_TABLE)
+      : db.scanTable(SESSION_MESSAGE_TABLE, (row) => row.session_id === sessionId);
+  requireRowColumns(rows, SESSION_MESSAGE_TABLE, [
+    "id",
+    "session_id",
+    "type",
+    "seq",
+    "data",
+  ]);
+
+  const bySession = new Map<string, OpencodeV2MessageRow[]>();
+  for (const row of rows) {
+    const sessionId_ = typeof row.session_id === "string" ? row.session_id : "";
+    const id = typeof row.id === "string" ? row.id : "";
+    const type = typeof row.type === "string" ? row.type : "";
+    if (!sessionId_ || !id || !type) continue;
+    const data = parseDataJson(row.data);
+    if (!data) continue;
+    const list = bySession.get(sessionId_) ?? [];
+    list.push({
+      id,
+      seq: typeof row.seq === "number" ? row.seq : 0,
+      type,
+      data,
+    });
+    bySession.set(sessionId_, list);
+  }
+  for (const list of bySession.values()) list.sort((a, b) => a.seq - b.seq);
+  return bySession;
+}
+
+// ---------- combined store ----------
+
+/**
+ * What one open of the database yields. A v1 store fills only `v1`; a v2
+ * store fills `v2SessionIds` + `v2Messages` and — while the migration marker
+ * is unfinished — also `v1` for the sessions not yet imported.
+ */
+interface OpencodeStore {
+  /** Ids present in `session_v2`; null when the database is a v1 store. */
+  v2SessionIds: ReadonlySet<string> | null;
+  v2Messages: ReadonlyMap<string, OpencodeV2MessageRow[]>;
+  v1: OpencodeSessionStore | null;
+}
+
+function emptyStore(): OpencodeStore {
+  return { v2SessionIds: null, v2Messages: new Map(), v1: null };
+}
+
+function scanStore(
+  db: ReadOnlyDb,
+  sessionId: string | undefined,
+): OpencodeStore {
+  const shape = detectSchemaShape(db);
+  if (!shape.v2) {
+    return {
+      v2SessionIds: null,
+      v2Messages: new Map(),
+      v1: scanMessagesAndParts(db, sessionId),
+    };
+  }
+  return {
+    v2SessionIds: scanV2SessionIds(db, sessionId),
+    v2Messages: scanV2Messages(db, sessionId),
+    v1: shape.v1Pending ? scanMessagesAndParts(db, sessionId) : null,
+  };
+}
+
 /** Search-scoped whole-db store, prepared and released by the orchestrator.
  * One-session extract / context calls never populate it. */
-const preparedStore = createSqlitePreparedStore<OpencodeSessionStore>();
+const preparedStore = createSqlitePreparedStore<OpencodeStore>();
 
 function loadSessionStore(
   dbPath: string,
   warnings: MemWarning[],
   sessionId?: string,
-): OpencodeSessionStore {
-  return withSqliteDb(
-    dbPath,
-    warnings,
-    SQLITE_WARNINGS,
-    emptySessionStore(),
-    (db) => scanMessagesAndParts(db, sessionId),
+): OpencodeStore {
+  return withSqliteDb(dbPath, warnings, SQLITE_WARNINGS, emptyStore(), (db) =>
+    scanStore(db, sessionId),
   );
 }
 
@@ -270,28 +439,14 @@ export function releaseOpencodeSessionStore(): void {
   preparedStore.release();
 }
 
-/** Read one session's messages + parts, reusing the search-scoped store when
- * the orchestrator prepared one for this same database. */
-function readSessionMessages(
+/** Read the store for one session, reusing the search-scoped prepared store
+ * when the orchestrator prepared one for this same database. */
+function readSessionStore(
   dbPath: string,
   sessionId: string,
   warnings: MemWarning[],
-): {
-  messages: OpencodeMessageRow[];
-  partsByMsg: Map<string, OpencodePartRow[]>;
-} {
-  const prepared = preparedStore.get(dbPath);
-  if (prepared) {
-    return {
-      messages: prepared.messagesBySession.get(sessionId) ?? [],
-      partsByMsg: prepared.partsByMsg,
-    };
-  }
-  const store = loadSessionStore(dbPath, warnings, sessionId);
-  return {
-    messages: store.messagesBySession.get(sessionId) ?? [],
-    partsByMsg: store.partsByMsg,
-  };
+): OpencodeStore {
+  return preparedStore.get(dbPath) ?? loadSessionStore(dbPath, warnings, sessionId);
 }
 
 // ---------- compaction ----------
@@ -381,6 +536,94 @@ function buildTextTurn(
   return merged.trim() ? { role: msg.role, text: merged } : null;
 }
 
+// ---------- v2 turn extraction ----------
+
+/** v2 user message: `data.text` is the user input, cleaned like a v1 turn. */
+function buildV2UserTurn(data: Record<string, unknown>): DialogueTurn | null {
+  const raw = typeof data.text === "string" ? data.text : "";
+  if (!raw) return null;
+  const text = stripInjectionTags(raw);
+  if (isBootstrapTurn(text, raw.length)) return null;
+  return text.trim() ? { role: "user", text } : null;
+}
+
+/** v2 assistant message: text lives in `data.content[]` elements of type
+ * "text". `reasoning` and `tool` elements are not dialogue and are skipped,
+ * matching what the v1 path does with non-text parts. */
+function buildV2AssistantTurn(
+  data: Record<string, unknown>,
+): DialogueTurn | null {
+  const content = data.content;
+  if (!Array.isArray(content)) return null;
+  const collected: string[] = [];
+  let totalRaw = 0;
+  for (const element of content) {
+    if (!isRecord(element)) continue;
+    if (element.type !== "text") continue;
+    const txt = typeof element.text === "string" ? element.text : "";
+    if (!txt) continue;
+    totalRaw += txt.length;
+    collected.push(stripInjectionTags(txt));
+  }
+  if (!collected.length) return null;
+
+  const merged = collected.join("\n\n");
+  if (isBootstrapTurn(merged, totalRaw)) return null;
+  return merged.trim() ? { role: "assistant", text: merged } : null;
+}
+
+/** A completed compaction becomes a boundary marker carrying the summary
+ * OpenCode kept; a running/failed compaction changed nothing and is skipped. */
+function buildV2CompactionTurn(
+  data: Record<string, unknown>,
+): DialogueTurn | null {
+  if (data.status !== "completed") return null;
+  return compactionBoundaryTurn(
+    "context compacted here; the turns above are still in the OpenCode database",
+    typeof data.summary === "string" ? data.summary : undefined,
+  );
+}
+
+/**
+ * One v2 message becomes at most one turn. `system` / `synthetic` / `skill` /
+ * `shell` / `idle` / `*-switched` rows are session bookkeeping, not dialogue.
+ * Rows are pre-sorted by `seq` (see {@link scanV2Messages}).
+ */
+function buildV2Turns(rows: readonly OpencodeV2MessageRow[]): DialogueTurn[] {
+  const turns: DialogueTurn[] = [];
+  for (const row of rows) {
+    const turn =
+      row.type === "user"
+        ? buildV2UserTurn(row.data)
+        : row.type === "assistant"
+          ? buildV2AssistantTurn(row.data)
+          : row.type === "compaction"
+            ? buildV2CompactionTurn(row.data)
+            : null;
+    if (turn) turns.push(turn);
+  }
+  return turns;
+}
+
+/** v1 extraction over one session of a (possibly whole-db) store. */
+function buildV1Turns(
+  store: OpencodeSessionStore,
+  sessionId: string,
+): DialogueTurn[] {
+  const messages = store.messagesBySession.get(sessionId) ?? [];
+  const summaryIds = compactSummaryMessageIds(messages, store.partsByMsg);
+  const turns: DialogueTurn[] = [];
+  for (const msg of messages) {
+    const turn = buildTextTurn(
+      msg,
+      store.partsByMsg.get(msg.id) ?? [],
+      summaryIds,
+    );
+    if (turn) turns.push(turn);
+  }
+  return turns;
+}
+
 // ---------- list ----------
 
 /** Largest absolute time value an ECMAScript Date can represent. */
@@ -394,10 +637,48 @@ function toIso(epochMs: unknown): string | undefined {
   return new Date(epochMs).toISOString();
 }
 
+interface SessionRowSource {
+  rows: SqliteRow[];
+  cwdColumn: string;
+}
+
+/** Validate the v1 `session` table and return its rows plus the column
+ * carrying the workspace directory. */
+function scanV1SessionRows(db: ReadOnlyDb): SessionRowSource {
+  const table = findTable(db, SESSION_TABLE);
+  requireColumns(table, ["id", "time_created", "time_updated"]);
+  const cwdColumn = requireOneOfColumns(table, SESSION_CWD_COLUMNS);
+  const rows = db.scanTable(SESSION_TABLE);
+  requireRowColumns(rows, SESSION_TABLE, [
+    "id",
+    cwdColumn,
+    "time_created",
+    "time_updated",
+  ]);
+  return { rows, cwdColumn };
+}
+
+/** Validate `session_v2` and return its rows. `directory` is the only
+ * workspace-column spelling in the v2 schema (NOT NULL there). */
+function scanV2SessionRows(db: ReadOnlyDb): SessionRowSource {
+  const table = findTable(db, SESSION_V2_TABLE);
+  requireColumns(table, ["id", "directory", "time_created", "time_updated"]);
+  const rows = db.scanTable(SESSION_V2_TABLE);
+  requireRowColumns(rows, SESSION_V2_TABLE, [
+    "id",
+    "directory",
+    "time_created",
+    "time_updated",
+  ]);
+  return { rows, cwdColumn: "directory" };
+}
+
 /**
- * List OpenCode sessions from the `session` table only — listing never touches
- * `message` or `part`. A machine with no OpenCode store lists nothing and
- * warns about nothing.
+ * List OpenCode sessions from the session table(s) only — listing never
+ * touches message rows. A machine with no OpenCode store lists nothing and
+ * warns about nothing. On a v2 store whose v1→v2 import is still running,
+ * both generations are listed and de-duplicated by session id, keeping the
+ * v2 copy.
  */
 export function opencodeListSessions(
   f: MemFilter,
@@ -406,57 +687,55 @@ export function opencodeListSessions(
   const dbPath = opencodeDbPath();
   if (dbPath === undefined || !fs.existsSync(dbPath)) return [];
 
-  const listed = withSqliteDb(
+  const sources = withSqliteDb(
     dbPath,
     warnings,
     SQLITE_WARNINGS,
-    null as { rows: SqliteRow[]; cwdColumn: string } | null,
+    null as SessionRowSource[] | null,
     (db) => {
-      const table = findTable(db, SESSION_TABLE);
-      requireColumns(table, ["id", "time_created", "time_updated"]);
-      const cwdColumn = requireOneOfColumns(table, SESSION_CWD_COLUMNS);
-      const rows = db.scanTable(SESSION_TABLE);
-      requireRowColumns(rows, SESSION_TABLE, [
-        "id",
-        cwdColumn,
-        "time_created",
-        "time_updated",
-      ]);
-      return { rows, cwdColumn };
+      const shape = detectSchemaShape(db);
+      if (!shape.v2) return [scanV1SessionRows(db)];
+      // v2 first: the id de-dup below keeps the v2 copy of a shared id.
+      const listed = [scanV2SessionRows(db)];
+      if (shape.v1Pending) listed.push(scanV1SessionRows(db));
+      return listed;
     },
   );
-  if (!listed) return [];
-  const { rows, cwdColumn } = listed;
+  if (!sources) return [];
 
+  const seen = new Set<string>();
   const out: MemSessionInfo[] = [];
-  for (const row of rows) {
-    const id = typeof row.id === "string" ? row.id : "";
-    if (!id) continue;
+  for (const { rows, cwdColumn } of sources) {
+    for (const row of rows) {
+      const id = typeof row.id === "string" ? row.id : "";
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
 
-    const directory =
-      typeof row[cwdColumn] === "string"
-        ? (row[cwdColumn] as string)
-        : undefined;
-    if (f.cwd && !sameProject(directory, f.cwd)) continue;
+      const directory =
+        typeof row[cwdColumn] === "string"
+          ? (row[cwdColumn] as string)
+          : undefined;
+      if (f.cwd && !sameProject(directory, f.cwd)) continue;
 
-    const created = toIso(row.time_created);
-    const updated = toIso(row.time_updated) ?? created;
-    if (!inRangeOverlap(created, updated, f)) continue;
+      const created = toIso(row.time_created);
+      const updated = toIso(row.time_updated) ?? created;
+      if (!inRangeOverlap(created, updated, f)) continue;
 
-    out.push({
-      platform: "opencode",
-      id,
-      title: typeof row.title === "string" ? row.title : undefined,
-      cwd: directory,
-      created,
-      updated,
-      filePath: dbPath,
-      // Sub-agent sessions point at their dispatcher; `--include-children`
-      // merges them into the parent.
-      ...(typeof row.parent_id === "string" && row.parent_id
-        ? { parent_id: row.parent_id }
-        : {}),
-    });
+      out.push({
+        platform: "opencode",
+        id,
+        title: typeof row.title === "string" ? row.title : undefined,
+        cwd: directory,
+        created,
+        updated,
+        filePath: dbPath,
+        // Sub-agent sessions point at their dispatcher; `--include-children`
+        // merges them into the parent.
+        ...(typeof row.parent_id === "string" && row.parent_id
+          ? { parent_id: row.parent_id }
+          : {}),
+      });
+    }
   }
   return out;
 }
@@ -467,18 +746,14 @@ export function opencodeExtractDialogue(
   s: MemSessionInfo,
   warnings: MemWarning[] = [],
 ): DialogueTurn[] {
-  const { messages, partsByMsg } = readSessionMessages(
-    s.filePath,
-    s.id,
-    warnings,
-  );
-  const summaryIds = compactSummaryMessageIds(messages, partsByMsg);
-  const turns: DialogueTurn[] = [];
-  for (const msg of messages) {
-    const turn = buildTextTurn(msg, partsByMsg.get(msg.id) ?? [], summaryIds);
-    if (turn) turns.push(turn);
+  const store = readSessionStore(s.filePath, s.id, warnings);
+  // A session id present in `session_v2` is authoritative there; the v1 copy
+  // the migration left behind must not double its turns.
+  if (store.v2SessionIds?.has(s.id)) {
+    return buildV2Turns(store.v2Messages.get(s.id) ?? []);
   }
-  return turns;
+  if (store.v1) return buildV1Turns(store.v1, s.id);
+  return [];
 }
 
 export function opencodeSearch(

@@ -57,13 +57,16 @@ platform's file set is described exactly once and `trellis init` and `trellis
 update` cannot disagree about it. Copy `configurators/cursor.ts` (30 lines) or
 `configurators/antigravity.ts` (15 lines) as the shape.
 
-Only three platforms spell both fields, each for a named residual: claude-code
+Only four platforms spell both fields, each for a named residual: claude-code
 (the `--with-statusline` flag), codex (an intentionally empty `.codex/skills/`),
-zcode (a stderr notice). A residual is work that survives *after* the shared
-writer and cannot be a path→content pair; it never adds a file. If your
-platform seems to need one, read `configurator-shared.md` → "Template maps"
-first — the parity oracle in `test/configurators/platforms.test.ts` will fail
-the build if it is really just an extra write.
+zcode (a stderr notice), opencode (a best-effort stderr warning when the
+installed `opencode` binary is below v2 — Trellis's OpenCode templates target
+the v2 plugin API and `permissions:` frontmatter). A residual is work that
+survives *after* the shared writer and cannot be a path→content pair; it never
+adds a file. If your platform seems to need one, read
+`configurator-shared.md` → "Template maps" first — the parity oracle in
+`test/configurators/platforms.test.ts` will fail the build if it is really
+just an extra write.
 
 ### Step 4: Templates
 
@@ -96,15 +99,15 @@ the build if it is really just an extra write.
 
 **JS plugin pattern** (OpenCode):
 
-| Directory                                    | Contents                     |
-| -------------------------------------------- | ---------------------------- |
-| `src/templates/{platform}/`                  | Root directory               |
-| `src/templates/{platform}/commands/trellis/` | Slash commands (`.md` files) |
-| `src/templates/{platform}/plugin/`           | JS plugin files              |
-| `src/templates/{platform}/lib/`              | JS library files             |
-| `src/templates/{platform}/package.json`      | Plugin dependencies          |
+| Directory                                    | Contents                                       |
+| -------------------------------------------- | ---------------------------------------------- |
+| `src/templates/{platform}/`                  | Root directory                                 |
+| `src/templates/{platform}/agents/`           | Agent definitions (v2 `permissions:` frontmatter) |
+| `src/templates/{platform}/commands/trellis/` | Slash commands (`.md` files)                   |
+| `src/templates/{platform}/plugins/`          | JS plugin files (v2 plugin API)                |
+| `src/templates/{platform}/lib/`              | JS library files                               |
 
-> Note: OpenCode uses JS plugins instead of Python hooks and has no `index.ts` template module — `collectOpenCodeTemplates()` (`opencode.ts:79-95`) walks the template directory instead, then adds commands and skills from `common/`. It is registered through `fromTemplates` like every other platform, so `trellis update` tracks OpenCode files normally. If a new platform uses JS plugins, follow this pattern — and note the walk's `EXCLUDE_PATTERNS` keeps `.js` (real plugin code) while dropping `.js.map` / `.d.ts` build artifacts.
+> Note: OpenCode uses JS plugins instead of Python hooks and has no `index.ts` template module — `collectOpenCodeTemplates()` (`opencode.ts`) walks the template directory instead, then adds commands and skills from `common/`. The plugins target the **OpenCode v2 plugin API**: each plugin default-exports a plain `{ id, async setup(ctx) }` object and registers `ctx.session.hook("context")` / `ctx.tool.hook("execute.before")` handlers. They import only Node built-ins plus the sibling `lib/` modules, and the template ships **no `package.json`** — OpenCode v2 does not read `.opencode/package.json`, and a bare `@opencode/plugin` import would fail to resolve without one (`Plugin.define` is only a typing helper; the runtime accepts a plain definition object). OpenCode is one of the four platforms that spell both `configure` and `collectTemplates` (see Step 3): `configureOpenCode()` writes the map and then runs `warnIfOpenCodeBelowV2()`, a best-effort `opencode --version` probe (3s timeout, silent skip on any failure) that prints a bilingual upgrade hint when the installed major version is below 2 — it never blocks and never changes the exit code. If a new platform uses JS plugins, follow this pattern — and note the walk's `EXCLUDE_PATTERNS` keeps `.js` (real plugin code) while dropping `.js.map` / `.d.ts` build artifacts.
 
 **TypeScript extension pattern** (Pi Agent):
 
@@ -414,9 +417,10 @@ Cursor IDE may send `transcript_path: null`; this must not prevent session
 scoping when `session_id` or `conversation_id` is present.
 
 OpenCode has **no** entry in any env table. Its plugin holds the session
-identity and injects it, so the plugin must prefix Bash tool commands in
-`tool.execute.before` with a shell-aware `TRELLIS_CONTEXT_ID` assignment when
-the command does not already set one: POSIX shells use
+identity and injects it, so the plugin must prefix shell tool commands in the
+v2 `tool` `execute.before` hook (whose event carries `sessionID`/`agent`;
+`shell` `create.before` does not) with a shell-aware `TRELLIS_CONTEXT_ID`
+assignment when the command does not already set one: POSIX shells use
 `export TRELLIS_CONTEXT_ID=<context-key>;`, while Windows PowerShell uses
 `$env:TRELLIS_CONTEXT_ID = '<context-key>';`. That prefix is the only channel
 by which an AI-run `task.py` sees an OpenCode session. Do not infer the
@@ -462,7 +466,7 @@ by the host. Hooks and plugins should pass `TRELLIS_CONTEXT_ID` to subprocesses
 they launch. Claude Code is special: SessionStart provides `CLAUDE_ENV_FILE`,
 so the shared hook must persist `export TRELLIS_CONTEXT_ID=<context-key>` there
 for later Bash tool calls in the same conversation. OpenCode is also special:
-there is no env-file bridge, so the JS plugin must prefix Bash tool commands
+there is no env-file bridge, so the JS plugin must prefix shell tool commands
 with a shell-aware `TRELLIS_CONTEXT_ID` assignment using plugin session identity
 before execution; on Windows, this must be shell-dialect-aware rather than a
 plain `process.platform === "win32"` check. **No researched platform has a
@@ -1157,36 +1161,36 @@ Platform's native sub-agent-start hook delivers context before the child runs. M
 | Cursor        | `preToolUse` + matcher `Task          | Subagent`                               | `updated_input.prompt` (Cursor staff marked Task prompt mutation fixed on 2026-04-07; current Cursor may emit native sub-agent calls as tool name `Subagent`, and native Task args may encode custom agents as `subagent_type.custom.name`) |
 | Factory Droid | `PreToolUse` + matcher `Task`         | `updatedInput.prompt`                   |
 | Kiro          | per-agent `agentSpawn` hook           | direct stdout context                   |
-| OpenCode      | JS plugin `tool.execute.before`       | `args.prompt` mutation                  |
+| OpenCode      | JS plugin `tool` `execute.before` hook (v2) | `event.input.prompt` mutation (the v2 sub-agent tool takes `{agent, description, prompt}`) |
 | Snow CLI      | `beforeSubAgentStart`                 | own `write-trellis-context.py subagent` (Snow bundles all three inject hooks; it is not in `SHARED_HOOKS_BY_PLATFORM`) |
 | ZCode         | `PreToolUse` + matcher `Agent|Task`   | `hookSpecificOutput.updatedInput.prompt` |
 
 #### OpenCode injection contract (issue #264)
 
-OpenCode is a hybrid class-1 platform: its main session uses `tool.execute.before` for sub-agent prompt mutation, but it also runs separate `chat.message` plugins (`session-start.js`, `inject-workflow-state.js`) that fire for **every** chat turn — including sub-agent child sessions. Without explicit filtering, those plugins inject 30-40KB of main-session SessionStart context into sub-agent turns and drown the parent's intended prompt injection.
+OpenCode is a hybrid class-1 platform: its main session uses the v2 `tool` `execute.before` hook for sub-agent prompt mutation, but it also runs separate `context` session-hook plugins (`session-start.js`, `inject-workflow-state.js`) that fire on **every** agent-loop model request — including sub-agent child sessions. Without explicit filtering, those plugins inject 30-40KB of main-session SessionStart context into sub-agent turns and drown the parent's intended prompt injection.
 
-**Required contract** for any OpenCode `chat.message` plugin that mutates `output.parts`:
+**Required contract** for any OpenCode `context` session-hook plugin that mutates `event.messages`:
 
 ```js
 import { isTrellisSubagent } from "../lib/trellis-context.js"
 
-"chat.message": async (input, output) => {
-  if (isTrellisSubagent(input)) {
-    // input.agent matched /^trellis-(implement|check|research)$/
+await ctx.session.hook("context", async (event) => {
+  if (isTrellisSubagent(event)) {
+    // event.agent matched /^trellis-(implement|check|research)$/
     // Sub-agent context is injected by inject-subagent-context.js on the
-    // parent's tool.execute.before — do not double-inject here.
+    // parent's tool execute.before — do not double-inject here.
     return
   }
   // ... main-session injection ...
-}
+})
 ```
 
-`isTrellisSubagent()` lives in `lib/trellis-context.js`; the regex matches `trellis-implement` / `trellis-check` / `trellis-research` exactly.
+`isTrellisSubagent()` lives in `lib/trellis-context.js`; the regex matches `trellis-implement` / `trellis-check` / `trellis-research` exactly. Unlike the v1 `chat.message` payload, the v2 `context` event carries `sessionID` and `agent` directly, so no message-scanning hack is needed to identify the caller.
 
-**Sub-agent task resolution order** in `inject-subagent-context.js` `tool.execute.before` (only later steps run when earlier ones miss):
+**Sub-agent task resolution order** in `inject-subagent-context.js`'s `tool` `execute.before` handler (only later steps run when earlier ones miss):
 
-1. Exact session runtime context lookup for `input.sessionID` (writes a `session:<key>` source)
-2. `Active task: <path>` line parsed from `args.prompt` first non-empty line (source `prompt-hint`) — explicit per-dispatch override, beats single-session inference so multi-window users can disambiguate
+1. Exact session runtime context lookup for `event.sessionID` (writes a `session:<key>` source)
+2. `Active task: <path>` line parsed from `event.input.prompt` first non-empty line (source `prompt-hint`) — explicit per-dispatch override, beats single-session inference so multi-window users can disambiguate
 3. Single-session fallback in `TrellisContext._resolveSingleSessionFallback()` — only when exactly 1 file exists in `.trellis/.runtime/sessions/`; refuses to guess when 0 or ≥2 files exist (source `session-fallback:<context_key>`). Mirrors Python `_resolve_single_session_fallback` (`active_task.py:497-519`).
 
 `buildPrompt()` for implement / check / finish / research **must** prepend `<!-- trellis-hook-injected -->` so generated agent definitions in `.opencode/agents/*.md` can detect a successful injection (Trellis-internal contract; OpenCode itself ignores the marker).
@@ -1704,7 +1708,7 @@ model-visible consumption is verified end to end.
 | --- | --- | ---: |
 | `shared-hooks/session-start.py` | Existing shared hook output (`hookSpecificOutput.additionalContext` plus host-specific aliases, or Kiro's plain stdout context) | Yes |
 | `codex/hooks/session-start.py` | Existing Codex SessionStart payload when hooks are enabled and approved | Yes |
-| `opencode/lib/session-utils.js` + `plugins/session-start.js` | Compact context prepended to the first user message and marked for persistence | Yes |
+| `opencode/lib/session-utils.js` + `plugins/session-start.js` | Compact context prepended ephemerally to the latest user message via the v2 `context` session hook (outgoing model call only; never persisted) | Yes |
 | `pi/extensions/trellis/index.ts.txt` | Memoized SessionStart-equivalent context added to `before_agent_start.systemPrompt` | Yes |
 | `copilot/hooks/session-start.py` | Microsoft's documented `SessionStart.hookSpecificOutput.additionalContext` payload | No |
 
@@ -1733,8 +1737,11 @@ plugin, and the Pi extension each build their own payload and do not carry it.
   README frequency, commit history, or other repository content.
 - Keep hook payload keys, compact context content, event timing, and
   per-session deduplication unchanged.
-- OpenCode persists startup context once per session. Pi memoizes identical
-  startup `systemPrompt` bytes per context key.
+- OpenCode re-injects startup context ephemerally on each agent-loop request
+  (the v2 `context` hook never touches persisted history); the
+  `<first-reply-notice>` is included only while the transcript has no
+  assistant message. Pi memoizes identical startup `systemPrompt` bytes per
+  context key.
 - **The Trellis update reminder rides this block, and only this block.** When
   `get_update_hint()` returns a hint, exactly one line is inserted between the
   notice head and tail: `Also relay this Trellis maintenance notice on its own
@@ -1751,7 +1758,7 @@ plugin, and the Pi extension each build their own payload and do not carry it.
 | Request has no clear natural language and project instructions explicitly establish a communication language | Acknowledgment uses the explicit project language |
 | Neither request nor project instructions provide a language | Acknowledgment is exactly `Trellis SessionStart ✓` |
 | Later assistant reply in the same session | No repeated acknowledgment |
-| Repeated OpenCode message in one session | Startup context is not prepended again |
+| Later OpenCode model request in one session | Context is re-injected ephemerally, but `<first-reply-notice>` is stripped once the transcript has an assistant message |
 | Repeated Pi turn with the same context key | Memoized startup `systemPrompt` bytes remain stable |
 | Shared or Codex hook output | Existing payload keys and `SessionStart` event name remain unchanged |
 | Copilot SessionStart | Context remains notice-free |
@@ -1774,8 +1781,8 @@ plugin, and the Pi extension each build their own payload and do not carry it.
   compact context blocks, the adaptive priority, neutral fallback, one-shot
   rule, and absence of fixed Chinese wording.
 - Build OpenCode context and exercise its plugin entry point; assert adaptive
-  notice content, first-message prefix and persistence, and no second injection
-  in the same session.
+  notice content, ephemeral prepend onto the latest user message, and notice
+  stripping once an assistant message exists in the transcript.
 - Exercise Pi `before_agent_start`; assert normal startup/workflow context,
   adaptive notice content, and byte-stable memoized `systemPrompt` behavior.
 - Keep Copilot regression assertions notice-free.
@@ -2051,7 +2058,7 @@ The same rule applies to every other hook that's positioned as "repeated reminde
 | Gemini CLI      | `UserPromptSubmit`                                                                                    | `.gemini/settings.json`                                                                                            | Auto                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | Copilot CLI     | `userPromptSubmitted` (camelCase)                                                                     | `.github/copilot/hooks.json`                                                                                       | `bash` + `powershell` dual field                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | Codex           | `UserPromptSubmit`                                                                                    | `.codex/hooks.json`                                                                                                | **Requires `features.hooks = true` in user's `~/.codex/config.toml` (Codex 0.129+; legacy: `codex_hooks = true`).** Codex 0.129+ also requires running `/hooks` once to approve the installed hook before it activates — until approved, hooks never fire (the trellis-bootstrap fallback in inject-workflow-state.py covers the gap by directing the AI to read `trellis-start` skill manually)                                                                                                                                                                                                                                                                                                                                                                                        |
-| OpenCode        | `chat.message` (Bun plugin)                                                                           | `plugins/inject-workflow-state.js`                                                                                 | Equivalent JS implementation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| OpenCode        | v2 `context` session hook (`ctx.session.hook("context")`)                                             | `plugins/inject-workflow-state.js`                                                                                 | Equivalent JS implementation; fires on every agent-loop model request, mutates only the outgoing payload                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | Kiro            | CLI: `userPromptSubmit` (main `trellis` agent JSON) · IDE: `promptSubmit` (`.kiro/hooks/*.kiro.hook`) | CLI: `.kiro/agents/trellis.json` `hooks` · IDE: `.kiro/hooks/trellis-workflow-state.kiro.hook` (`then.runCommand`) | Plain stdout (NOT the `hookSpecificOutput` JSON envelope) — Kiro adds a hook's raw stdout to conversation context. `inject-workflow-state.py` has a `platform == "kiro"` branch (detected via `KIRO_PROJECT_DIR` env or `.kiro` script path) that prints the bare breadcrumb. **Activation:** CLI users must make `trellis` the active agent (`kiro-cli settings chat.defaultAgent trellis` or `/agent swap trellis`) — Kiro defaults to built-in `kiro_default`. **Real-machine note:** the plain-stdout→context contract (and whether IDE `runCommand` stdout is injected vs only `askAgent`) is per official docs, pending Kiro hardware verification; fallback is `askAgent` + static steering. Sub-agent context injection unchanged via `agentSpawn → inject-subagent-context.py` |
 | Trae IDE        | `UserPromptSubmit`                                                                                    | `.trae/hooks.json`                                                                                                 | Auto; shared Python hook written under `.trae/hooks/inject-workflow-state.py`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ZCode           | `UserPromptSubmit`                                                                                    | `.zcode/config.json`                                                                                               | Shared Python hook under `.zcode/hooks/`. Hook config is read at session start with no hot-reload, so `configureZcode` prints a one-shot "open a new session" notice                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |

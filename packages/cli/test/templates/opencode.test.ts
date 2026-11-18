@@ -1,6 +1,7 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   contextCollector,
@@ -11,17 +12,13 @@ import {
 } from "../../src/templates/opencode/lib/trellis-context.js";
 import {
   findUserTextPart,
-  insertSyntheticTextPart,
-  MESSAGES_TRANSFORM_HOOK,
   prependEphemeralText,
 } from "../../src/templates/opencode/lib/context-visibility.js";
-import {
-  buildSessionContext,
-  hasInjectedTrellisContext,
-} from "../../src/templates/opencode/lib/session-utils.js";
+import { buildSessionContext } from "../../src/templates/opencode/lib/session-utils.js";
 import injectSubagentContextPlugin from "../../src/templates/opencode/plugins/inject-subagent-context.js";
 import sessionStartPlugin from "../../src/templates/opencode/plugins/session-start.js";
 import injectWorkflowStatePlugin from "../../src/templates/opencode/plugins/inject-workflow-state.js";
+import { collectOpenCodeTemplates } from "../../src/configurators/opencode.js";
 
 interface TestContextCollector {
   processed: Set<string>;
@@ -30,75 +27,142 @@ interface TestContextCollector {
   clear(sessionID: string): void;
 }
 
-interface OpenCodeInjectHooks {
-  "tool.execute.before": (
-    input: unknown,
-    output: { args: { command: string } },
-  ) => Promise<void>;
+// ---------------------------------------------------------------------------
+// OpenCode v2 mock plugin context
+//
+// v2 plugins default-export `{ id, setup(ctx) }` and register hooks through
+// `ctx.session.hook` / `ctx.tool.hook` / `ctx.shell.hook`. The mock captures
+// the registered callbacks so tests can drive them with fabricated events.
+// ---------------------------------------------------------------------------
+
+type HookCallback = (event: never) => Promise<void> | void;
+
+interface CapturedHooks {
+  session: Map<string, HookCallback>;
+  tool: Map<string, HookCallback>;
+  shell: Map<string, HookCallback>;
 }
 
-async function createOpenCodeInjectHooks(
-  platform: NodeJS.Platform = "linux",
-  env: NodeJS.ProcessEnv = {},
-): Promise<OpenCodeInjectHooks> {
-  return (await injectSubagentContextPlugin({
-    directory: "/tmp/trellis-opencode-test",
-    platform,
-    env,
-  })) as OpenCodeInjectHooks;
+interface MockPluginCtx {
+  location: { directory: string };
+  session: { hook: (name: string, cb: HookCallback) => Promise<{ dispose(): void }> };
+  tool: { hook: (name: string, cb: HookCallback) => Promise<{ dispose(): void }> };
+  shell: { hook: (name: string, cb: HookCallback) => Promise<{ dispose(): void }> };
 }
 
-interface ChatMessagePart {
-  id?: string;
-  sessionID?: string;
-  messageID?: string;
-  type: string;
-  text?: string;
-  synthetic?: boolean;
-  metadata?: Record<string, unknown>;
-  [key: string]: unknown;
-}
-
-interface TransformMessage {
-  info: { role: string; sessionID?: string; agent?: string };
-  parts: ChatMessagePart[];
-}
-
-interface TransformHooks {
-  "experimental.chat.messages.transform": (
-    input: object,
-    output: { messages: TransformMessage[] },
-  ) => Promise<void>;
-}
-
-function createUserTextPart(
-  text: string,
-  sessionID = "main-session",
-  messageID = "message-a",
-  ordinal = "000000000010",
-): ChatMessagePart {
-  return {
-    id: `prt_${ordinal}abcdefghijklmn`,
-    sessionID,
-    messageID,
-    type: "text",
-    text,
+function createMockPluginCtx(directory: string): {
+  ctx: MockPluginCtx;
+  hooks: CapturedHooks;
+} {
+  const hooks: CapturedHooks = {
+    session: new Map(),
+    tool: new Map(),
+    shell: new Map(),
   };
+  const register =
+    (map: Map<string, HookCallback>) =>
+    async (name: string, cb: HookCallback) => {
+      map.set(name, cb);
+      return {
+        dispose: () => {
+          map.delete(name);
+        },
+      };
+    };
+  return {
+    ctx: {
+      location: { directory },
+      session: { hook: register(hooks.session) },
+      tool: { hook: register(hooks.tool) },
+      shell: { hook: register(hooks.shell) },
+    },
+    hooks,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// v2 message fixtures
+//
+// SessionRequestMessage = Message & { metadata? } — flat objects with
+// `role` and a `content` part array. Text parts are `{ type, text }`.
+// ---------------------------------------------------------------------------
+
+interface V2Message {
+  id?: string;
+  role: string;
+  content: Record<string, unknown>[];
+  metadata?: Record<string, unknown>;
+}
+
+interface SessionContextEvent {
+  sessionID: string;
+  agent: string;
+  system: Record<string, unknown>[];
+  messages: V2Message[];
+  options: Record<string, unknown>;
+  tools: Record<string, unknown>;
 }
 
 function userTurn(
   text: string,
   opts: { sessionID?: string; agent?: string; messageID?: string } = {},
-): TransformMessage {
-  const sessionID = opts.sessionID ?? "main-session";
+): V2Message {
   return {
-    info: {
-      role: "user",
-      sessionID,
-      agent: opts.agent ?? "build",
-    },
-    parts: [createUserTextPart(text, sessionID, opts.messageID)],
+    id: opts.messageID ?? "message-a",
+    role: "user",
+    content: [{ type: "text", text }],
   };
+}
+
+function contextEvent(
+  messages: V2Message[],
+  opts: { sessionID?: string; agent?: string } = {},
+): SessionContextEvent {
+  return {
+    sessionID: opts.sessionID ?? "main-session",
+    agent: opts.agent ?? "build",
+    system: [],
+    messages,
+    options: {},
+    tools: {},
+  };
+}
+
+type ContextHook = (event: SessionContextEvent) => Promise<void>;
+
+interface ToolBeforeEvent {
+  tool: string;
+  sessionID: string;
+  agent: string;
+  input: Record<string, unknown>;
+}
+
+type ToolBeforeHook = (event: ToolBeforeEvent) => Promise<void>;
+
+async function loadSessionContextHook(directory: string): Promise<ContextHook> {
+  const { ctx, hooks } = createMockPluginCtx(directory);
+  await sessionStartPlugin.setup(ctx as never);
+  const hook = hooks.session.get("context");
+  expect(hook).toBeDefined();
+  return hook as ContextHook;
+}
+
+async function loadWorkflowContextHook(directory: string): Promise<ContextHook> {
+  const { ctx, hooks } = createMockPluginCtx(directory);
+  await injectWorkflowStatePlugin.setup(ctx as never);
+  const hook = hooks.session.get("context");
+  expect(hook).toBeDefined();
+  return hook as ContextHook;
+}
+
+async function loadSubagentHooks(directory: string): Promise<{
+  toolBefore: ToolBeforeHook;
+}> {
+  const { ctx, hooks } = createMockPluginCtx(directory);
+  await injectSubagentContextPlugin.setup(ctx as never);
+  const toolBefore = hooks.tool.get("execute.before");
+  expect(toolBefore).toBeDefined();
+  return { toolBefore: toolBefore as ToolBeforeHook };
 }
 
 describe("opencode session context dedupe", () => {
@@ -183,546 +247,208 @@ describe("opencode session-start history detection", () => {
   });
 
   it("injects startup context onto the latest user message without mutating stored parts", async () => {
-    const hooks = (await sessionStartPlugin({
-      directory: "/tmp/trellis-opencode-test",
-    })) as TransformHooks;
+    const hook = await loadSessionContextHook("/tmp/trellis-opencode-test");
 
     const firstUser = userTurn("First request", { sessionID: "session-a" });
-    const originalFirstParts = firstUser.parts;
-    const firstMessages = [firstUser];
-    await hooks[MESSAGES_TRANSFORM_HOOK]({}, { messages: firstMessages });
+    const originalFirstContent = firstUser.content;
+    const firstEvent = contextEvent([firstUser], { sessionID: "session-a" });
+    await hook(firstEvent);
 
-    expect(originalFirstParts).toHaveLength(1);
-    expect(originalFirstParts[0].text).toBe("First request");
-    expect(firstMessages[0]).not.toBe(firstUser);
-    expect(firstMessages[0].parts[0]).toMatchObject({
-      type: "text",
-      synthetic: true,
-    });
-    expect(firstMessages[0].parts[0].text).toMatch(/^<session-context>/);
-    expect(firstMessages[0].parts[0].text).toContain("<first-reply-notice>");
-    expect(firstMessages[0].parts[0].text).toContain("Trellis SessionStart ✓");
-    expect(firstMessages[0].parts[1]).toEqual(originalFirstParts[0]);
+    expect(originalFirstContent).toHaveLength(1);
+    expect(originalFirstContent[0].text).toBe("First request");
+    const injectedFirst = firstEvent.messages[0];
+    expect(injectedFirst).not.toBe(firstUser);
+    expect(injectedFirst.content[0]).toMatchObject({ type: "text" });
+    expect(injectedFirst.content[0].text).toMatch(/^<session-context>/);
+    expect(injectedFirst.content[0].text).toContain("<first-reply-notice>");
+    expect(injectedFirst.content[0].text).toContain("Trellis SessionStart ✓");
+    expect(injectedFirst.content[1]).toEqual(originalFirstContent[0]);
 
-    const laterUser = userTurn("Second request", {
-      sessionID: "session-a",
-      messageID: "message-b",
-    });
-    const originalLaterParts = laterUser.parts;
-    const laterMessages = [
-      firstUser,
-      { info: { role: "assistant", sessionID: "session-a" }, parts: [] },
-      laterUser,
-    ];
-    await hooks[MESSAGES_TRANSFORM_HOOK]({}, { messages: laterMessages });
+    const laterUser = userTurn("Second request", { messageID: "message-b" });
+    const originalLaterContent = laterUser.content;
+    const laterEvent = contextEvent(
+      [firstUser, { role: "assistant", content: [] }, laterUser],
+      { sessionID: "session-a" },
+    );
+    await hook(laterEvent);
 
-    expect(laterMessages[0]).toBe(firstUser);
-    expect(laterMessages[0].parts).toBe(originalFirstParts);
-    expect(originalLaterParts).toHaveLength(1);
-    expect(laterMessages[2].parts[0].text).toMatch(/^<session-context>/);
-    expect(laterMessages[2].parts[0].text).not.toContain("<first-reply-notice>");
-    expect(laterMessages[2].parts[1]).toEqual(originalLaterParts[0]);
-  });
-
-  it("detects persisted Trellis context from metadata", () => {
-    const messages = [
-      {
-        info: { role: "user" },
-        parts: [
-          {
-            type: "text",
-            text: "hello",
-            metadata: {
-              trellis: {
-                sessionStart: true,
-              },
-            },
-          },
-        ],
-      },
-    ];
-
-    expect(hasInjectedTrellisContext(messages)).toBe(true);
-  });
-
-  it("ignores unrelated user messages", () => {
-    const messages = [
-      {
-        info: { role: "user" },
-        parts: [
-          {
-            type: "text",
-            text: "normal prompt",
-          },
-        ],
-      },
-    ];
-
-    expect(hasInjectedTrellisContext(messages)).toBe(false);
+    expect(laterEvent.messages[0]).toBe(firstUser);
+    expect(laterEvent.messages[0].content).toBe(originalFirstContent);
+    expect(originalLaterContent).toHaveLength(1);
+    const injectedLater = laterEvent.messages[2];
+    expect(injectedLater.content[0].text).toMatch(/^<session-context>/);
+    expect(injectedLater.content[0].text).not.toContain("<first-reply-notice>");
+    expect(injectedLater.content[1]).toEqual(originalLaterContent[0]);
   });
 });
 
-describe("opencode bash session context", () => {
-  it("injects TRELLIS_CONTEXT_ID into Bash commands from plugin sessionID", async () => {
-    const hooks = await createOpenCodeInjectHooks();
-    const output = {
-      args: {
-        command: "python3 ./.trellis/scripts/task.py start .trellis/tasks/demo",
-      },
-    };
+describe("opencode shell command prefix injection", () => {
+  let toolBefore: ToolBeforeHook;
 
-    await hooks["tool.execute.before"](
-      { tool: "bash", sessionID: "oc-a" },
-      output,
+  beforeEach(async () => {
+    toolBefore = (await loadSubagentHooks("/tmp/trellis-opencode-test"))
+      .toolBefore;
+  });
+
+  function shellEvent(command: string, sessionID?: string): ToolBeforeEvent {
+    return {
+      tool: "shell",
+      sessionID: sessionID ?? "oc-a",
+      agent: "build",
+      input: { command },
+    };
+  }
+
+  async function withMockedHost(
+    platform: NodeJS.Platform,
+    env: NodeJS.ProcessEnv,
+    run: () => Promise<void>,
+  ): Promise<void> {
+    const descriptor = Object.getOwnPropertyDescriptor(process, "platform");
+    Object.defineProperty(process, "platform", { value: platform });
+    const saved: Record<string, string | undefined> = {};
+    for (const key of Object.keys(env)) {
+      saved[key] = process.env[key];
+      process.env[key] = env[key];
+    }
+    try {
+      await run();
+    } finally {
+      for (const key of Object.keys(env)) {
+        if (saved[key] === undefined) Reflect.deleteProperty(process.env, key);
+        else process.env[key] = saved[key];
+      }
+      if (descriptor) Object.defineProperty(process, "platform", descriptor);
+    }
+  }
+
+  it("prefixes shell commands with TRELLIS_CONTEXT_ID from the hook sessionID", async () => {
+    const event = shellEvent(
+      "python3 ./.trellis/scripts/task.py start .trellis/tasks/demo",
     );
 
-    expect(output.args.command).toBe(
+    await toolBefore(event);
+
+    expect(event.input.command).toBe(
       "export TRELLIS_CONTEXT_ID='opencode_oc-a'; python3 ./.trellis/scripts/task.py start .trellis/tasks/demo",
     );
   });
 
-  it("uses PowerShell environment syntax on Windows", async () => {
-    const hooks = await createOpenCodeInjectHooks("win32");
-    const output = {
-      args: {
-        command: "python ./.trellis/scripts/task.py start .trellis/tasks/demo",
-      },
-    };
+  it("does not inject without a sessionID on the event", async () => {
+    const event = shellEvent("git status --short", "");
+    event.sessionID = "";
 
-    await hooks["tool.execute.before"](
-      { tool: "bash", sessionID: "oc-a" },
-      output,
-    );
+    await toolBefore(event);
 
-    expect(output.args.command).toBe(
-      "$env:TRELLIS_CONTEXT_ID = 'opencode_oc-a'; python ./.trellis/scripts/task.py start .trellis/tasks/demo",
-    );
+    expect(event.input.command).toBe("git status --short");
   });
 
-  it("uses POSIX environment syntax on Windows Git Bash", async () => {
-    const hooks = await createOpenCodeInjectHooks("win32", {
-      MSYSTEM: "MINGW64",
-    });
-    const output = {
-      args: {
-        command: "git diff --name-only",
-      },
-    };
-
-    await hooks["tool.execute.before"](
-      { tool: "bash", sessionID: "oc-a" },
-      output,
+  it("is idempotent — an already-prefixed command is left untouched", async () => {
+    const event = shellEvent(
+      "export TRELLIS_CONTEXT_ID='opencode_oc-a'; git status --short",
     );
 
-    expect(output.args.command).toBe(
-      "export TRELLIS_CONTEXT_ID='opencode_oc-a'; git diff --name-only",
-    );
-  });
+    await toolBefore(event);
 
-  it("uses POSIX environment syntax when Windows OSTYPE indicates MSYS", async () => {
-    const hooks = await createOpenCodeInjectHooks("win32", {
-      OSTYPE: "msys",
-    });
-    const output = {
-      args: {
-        command: "git status --short",
-      },
-    };
-
-    await hooks["tool.execute.before"](
-      { tool: "bash", sessionID: "oc-a" },
-      output,
-    );
-
-    expect(output.args.command).toBe(
+    expect(event.input.command).toBe(
       "export TRELLIS_CONTEXT_ID='opencode_oc-a'; git status --short",
     );
   });
 
-  it("uses POSIX environment syntax when Windows MINGW_PREFIX is set", async () => {
-    const hooks = await createOpenCodeInjectHooks("win32", {
-      MINGW_PREFIX: "/mingw64",
-    });
-    const output = {
-      args: {
-        command: "git log --oneline -1",
-      },
-    };
-
-    await hooks["tool.execute.before"](
-      { tool: "bash", sessionID: "oc-a" },
-      output,
-    );
-
-    expect(output.args.command).toBe(
-      "export TRELLIS_CONTEXT_ID='opencode_oc-a'; git log --oneline -1",
-    );
-  });
-
-  it("uses POSIX environment syntax when Windows SHELL is bash", async () => {
-    const hooks = await createOpenCodeInjectHooks("win32", {
-      SHELL: "/usr/bin/bash",
-    });
-    const output = {
-      args: {
-        command: "git branch --show-current",
-      },
-    };
-
-    await hooks["tool.execute.before"](
-      { tool: "bash", sessionID: "oc-a" },
-      output,
-    );
-
-    expect(output.args.command).toBe(
-      "export TRELLIS_CONTEXT_ID='opencode_oc-a'; git branch --show-current",
-    );
-  });
-
-  it("uses POSIX environment syntax when OpenCode Git Bash path is configured", async () => {
-    const hooks = await createOpenCodeInjectHooks("win32", {
-      OPENCODE_GIT_BASH_PATH: "C:\\Program Files\\Git\\bin\\bash.exe",
-    });
-    const output = {
-      args: {
-        command: "git rev-parse --show-toplevel",
-      },
-    };
-
-    await hooks["tool.execute.before"](
-      { tool: "bash", sessionID: "oc-a" },
-      output,
-    );
-
-    expect(output.args.command).toBe(
-      "export TRELLIS_CONTEXT_ID='opencode_oc-a'; git rev-parse --show-toplevel",
-    );
-  });
-
   it("does not duplicate an explicit TRELLIS_CONTEXT_ID assignment", async () => {
-    const hooks = await createOpenCodeInjectHooks();
-    const output = {
-      args: {
-        command:
-          "TRELLIS_CONTEXT_ID=manual python3 ./.trellis/scripts/task.py current",
-      },
-    };
-
-    await hooks["tool.execute.before"](
-      { tool: "bash", sessionID: "oc-a" },
-      output,
-    );
-
-    expect(output.args.command).toBe(
+    for (const command of [
       "TRELLIS_CONTEXT_ID=manual python3 ./.trellis/scripts/task.py current",
-    );
-  });
-
-  it("does not duplicate an explicit exported TRELLIS_CONTEXT_ID", async () => {
-    const hooks = await createOpenCodeInjectHooks();
-    const output = {
-      args: {
-        command:
-          "export TRELLIS_CONTEXT_ID=manual; python3 ./.trellis/scripts/task.py current",
-      },
-    };
-
-    await hooks["tool.execute.before"](
-      { tool: "bash", sessionID: "oc-a" },
-      output,
-    );
-
-    expect(output.args.command).toBe(
       "export TRELLIS_CONTEXT_ID=manual; python3 ./.trellis/scripts/task.py current",
-    );
-  });
-
-  it("does not duplicate an explicit env TRELLIS_CONTEXT_ID assignment", async () => {
-    const hooks = await createOpenCodeInjectHooks();
-    const output = {
-      args: {
-        command:
-          "env FOO=bar TRELLIS_CONTEXT_ID=manual python3 ./.trellis/scripts/task.py current",
-      },
-    };
-
-    await hooks["tool.execute.before"](
-      { tool: "bash", sessionID: "oc-a" },
-      output,
-    );
-
-    expect(output.args.command).toBe(
       "env FOO=bar TRELLIS_CONTEXT_ID=manual python3 ./.trellis/scripts/task.py current",
-    );
-  });
-
-  it("does not duplicate an explicit PowerShell TRELLIS_CONTEXT_ID assignment", async () => {
-    const hooks = await createOpenCodeInjectHooks("win32");
-    const output = {
-      args: {
-        command:
-          "$env:TRELLIS_CONTEXT_ID = 'manual'; python ./.trellis/scripts/task.py current",
-      },
-    };
-
-    await hooks["tool.execute.before"](
-      { tool: "bash", sessionID: "oc-a" },
-      output,
-    );
-
-    expect(output.args.command).toBe(
-      "$env:TRELLIS_CONTEXT_ID = 'manual'; python ./.trellis/scripts/task.py current",
-    );
+    ]) {
+      const event = shellEvent(command);
+      await toolBefore(event);
+      expect(event.input.command).toBe(command);
+    }
   });
 
   it("does not treat a grep pattern as an explicit TRELLIS_CONTEXT_ID assignment", async () => {
-    const hooks = await createOpenCodeInjectHooks();
-    const output = {
-      args: {
-        command: "env | sort | grep '^TRELLIS_CONTEXT_ID='",
-      },
-    };
+    const event = shellEvent("env | sort | grep '^TRELLIS_CONTEXT_ID='");
 
-    await hooks["tool.execute.before"](
-      { tool: "bash", sessionID: "oc-a" },
-      output,
-    );
+    await toolBefore(event);
 
-    expect(output.args.command).toBe(
+    expect(event.input.command).toBe(
       "export TRELLIS_CONTEXT_ID='opencode_oc-a'; env | sort | grep '^TRELLIS_CONTEXT_ID='",
     );
+  });
+
+  it("uses PowerShell environment syntax on Windows", async () => {
+    await withMockedHost("win32", { SHELL: "", OSTYPE: "" }, async () => {
+      const event = shellEvent(
+        "python ./.trellis/scripts/task.py start .trellis/tasks/demo",
+      );
+
+      await toolBefore(event);
+
+      expect(event.input.command).toBe(
+        "$env:TRELLIS_CONTEXT_ID = 'opencode_oc-a'; python ./.trellis/scripts/task.py start .trellis/tasks/demo",
+      );
+    });
+  });
+
+  it("does not duplicate an explicit PowerShell TRELLIS_CONTEXT_ID assignment", async () => {
+    await withMockedHost("win32", { SHELL: "", OSTYPE: "" }, async () => {
+      const command =
+        "$env:TRELLIS_CONTEXT_ID = 'manual'; python ./.trellis/scripts/task.py current";
+      const event = shellEvent(command);
+
+      await toolBefore(event);
+
+      expect(event.input.command).toBe(command);
+    });
+  });
+
+  it("uses POSIX environment syntax on Windows Git Bash", async () => {
+    await withMockedHost("win32", { MSYSTEM: "MINGW64" }, async () => {
+      const event = shellEvent("git diff --name-only");
+
+      await toolBefore(event);
+
+      expect(event.input.command).toBe(
+        "export TRELLIS_CONTEXT_ID='opencode_oc-a'; git diff --name-only",
+      );
+    });
+  });
+
+  it("uses POSIX environment syntax when Windows OSTYPE indicates MSYS", async () => {
+    await withMockedHost("win32", { OSTYPE: "msys" }, async () => {
+      const event = shellEvent("git status --short");
+
+      await toolBefore(event);
+
+      expect(event.input.command).toBe(
+        "export TRELLIS_CONTEXT_ID='opencode_oc-a'; git status --short",
+      );
+    });
+  });
+
+  it("honors the TRELLIS_HOOKS / TRELLIS_DISABLE_HOOKS gates", async () => {
+    for (const [key, value] of [
+      ["TRELLIS_HOOKS", "0"],
+      ["TRELLIS_DISABLE_HOOKS", "1"],
+    ] as const) {
+      const previous = process.env[key];
+      process.env[key] = value;
+      try {
+        const event = shellEvent("git status --short");
+        await toolBefore(event);
+        expect(event.input.command).toBe("git status --short");
+      } finally {
+        if (previous === undefined) Reflect.deleteProperty(process.env, key);
+        else process.env[key] = previous;
+      }
+    }
   });
 });
 
 // ---------------------------------------------------------------------------
 // Issue #264 — sub-agent context injection + transform skip
 // ---------------------------------------------------------------------------
-
-interface TaskToolOutput {
-  args: {
-    subagent_type?: string;
-    prompt?: string;
-  };
-}
-
-interface TaskToolHooks {
-  "tool.execute.before": (
-    input: { tool: string; sessionID?: string; agent?: string },
-    output: TaskToolOutput,
-  ) => Promise<void>;
-}
-
-describe("opencode persisted synthetic context parts", () => {
-  it("creates deterministic complete identities without changing ordinary parts", () => {
-    const ordinary = createUserTextPart("original prompt");
-    ordinary.metadata = { user: { preserved: true } };
-    const firstParts = [structuredClone(ordinary)];
-    const secondParts = [structuredClone(ordinary)];
-
-    const first = insertSyntheticTextPart(
-      firstParts,
-      "session context",
-      "sessionStart",
-    );
-    const second = insertSyntheticTextPart(
-      secondParts,
-      "session context",
-      "sessionStart",
-    );
-
-    expect(first).toEqual(second);
-    expect(first).toMatchObject({
-      sessionID: "main-session",
-      messageID: "message-a",
-      type: "text",
-      text: "session context",
-      synthetic: true,
-    });
-    expect(first.id).toMatch(/^prt_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
-    expect(firstParts[1]).toEqual(ordinary);
-    expect(secondParts[1]).toEqual(ordinary);
-  });
-
-  it("keeps both insertion orders equal to ID-sorted replay order", () => {
-    for (const order of [
-      ["sessionStart", "workflowState"],
-      ["workflowState", "sessionStart"],
-    ]) {
-      const ordinary = createUserTextPart("ordinary user prompt");
-      const parts = [structuredClone(ordinary)];
-
-      for (const kind of order) {
-        insertSyntheticTextPart(
-          parts,
-          kind === "sessionStart" ? "session context" : "workflow context",
-          kind,
-        );
-      }
-
-      expect(parts.map(part => part.text)).toEqual([
-        "session context",
-        "workflow context",
-        "ordinary user prompt",
-      ]);
-      expect(parts.map(part => part.id)).toEqual(
-        [...parts]
-          .sort((left, right) =>
-            left.id < right.id ? -1 : left.id > right.id ? 1 : 0,
-          )
-          .map(part => part.id),
-      );
-      expect(parts[0].id).not.toBe(parts[1].id);
-      expect(parts[2]).toEqual(ordinary);
-      expect(findUserTextPart(parts)).toBe(parts[2]);
-    }
-  });
-
-  it("rejects unsupported kinds, missing identities, and duplicate IDs before mutation", () => {
-    const unsupportedParts = [createUserTextPart("prompt")];
-    const unsupportedBefore = structuredClone(unsupportedParts);
-    expect(() =>
-      insertSyntheticTextPart(unsupportedParts, "context", "unknown"),
-    ).toThrow("unknown context part kind");
-    expect(unsupportedParts).toEqual(unsupportedBefore);
-
-    const unsupportedIdentityParts = [
-      createUserTextPart(
-        "prompt",
-        "main-session",
-        "message-low-ordinal",
-        "000000000001",
-      ),
-    ];
-    const unsupportedIdentityBefore = structuredClone(
-      unsupportedIdentityParts,
-    );
-    expect(() =>
-      insertSyntheticTextPart(
-        unsupportedIdentityParts,
-        "context",
-        "sessionStart",
-      ),
-    ).toThrow("unsupported OpenCode part ID ordinal");
-    expect(unsupportedIdentityParts).toEqual(unsupportedIdentityBefore);
-
-    const missingIdentityParts: ChatMessagePart[] = [
-      { type: "text", text: "prompt" },
-    ];
-    const missingIdentityBefore = structuredClone(missingIdentityParts);
-    expect(() =>
-      insertSyntheticTextPart(
-        missingIdentityParts,
-        "context",
-        "sessionStart",
-      ),
-    ).toThrow("no ordinary OpenCode part with a persisted identity");
-    expect(missingIdentityParts).toEqual(missingIdentityBefore);
-
-    const duplicateParts = [createUserTextPart("prompt")];
-    insertSyntheticTextPart(duplicateParts, "context", "workflowState");
-    const duplicateBefore = structuredClone(duplicateParts);
-    expect(() =>
-      insertSyntheticTextPart(duplicateParts, "context", "workflowState"),
-    ).toThrow("duplicate synthetic context part");
-    expect(duplicateParts).toEqual(duplicateBefore);
-  });
-
-  it("fails closed on a legacy 19-character OpenCode part ID format without mutating parts", () => {
-    // OpenCode has changed its part ID format before: a live DB observed 5 of
-    // 2440 IDs still using this older, shorter shape. PART_ID_PATTERN must
-    // reject it rather than silently treat it as a valid identity source.
-    const legacyParts: ChatMessagePart[] = [
-      {
-        id: "prt_19b9634d8e5924s6zx6",
-        sessionID: "main-session",
-        messageID: "message-legacy",
-        type: "text",
-        text: "prompt",
-      },
-    ];
-    const legacyBefore = structuredClone(legacyParts);
-    expect(() =>
-      insertSyntheticTextPart(legacyParts, "context", "sessionStart"),
-    ).toThrow("no ordinary OpenCode part with a persisted identity");
-    expect(legacyParts).toEqual(legacyBefore);
-  });
-
-  it("uses an ordinary attachment as the identity source", () => {
-    const attachment: ChatMessagePart = {
-      id: "prt_000000000010abcdefghijklmn",
-      sessionID: "attachment-session",
-      messageID: "attachment-message",
-      type: "file",
-      mime: "application/pdf",
-      filename: "report.pdf",
-    };
-    const parts = [structuredClone(attachment)];
-
-    const inserted = insertSyntheticTextPart(
-      parts,
-      "workflow context",
-      "workflowState",
-    );
-
-    expect(inserted).toMatchObject({
-      sessionID: "attachment-session",
-      messageID: "attachment-message",
-      synthetic: true,
-    });
-    expect(parts[1]).toEqual(attachment);
-    expect(findUserTextPart(parts)).toBeUndefined();
-  });
-
-  it("uses the minimum-ordinal ordinary part as the identity source when a message has both a text and a file part", () => {
-    // Real ID shapes from a live OpenCode DB: same millisecond, adjacent
-    // counters. The text part (…c001) must win over the file part (…c002).
-    const textPart: ChatMessagePart = {
-      id: "prt_b9634c88c001aaaaaaaaaaaaaa",
-      sessionID: "main-session",
-      messageID: "message-multi-part",
-      type: "text",
-      text: "typed message",
-    };
-    const filePart: ChatMessagePart = {
-      id: "prt_b9634c88c002aaaaaaaaaaaaaa",
-      sessionID: "main-session",
-      messageID: "message-multi-part",
-      type: "file",
-      mime: "application/pdf",
-      filename: "report.pdf",
-    };
-    const parts = [structuredClone(textPart), structuredClone(filePart)];
-
-    const sessionStartPart = insertSyntheticTextPart(
-      parts,
-      "session context",
-      "sessionStart",
-    );
-    const workflowStatePart = insertSyntheticTextPart(
-      parts,
-      "workflow context",
-      "workflowState",
-    );
-
-    for (const ordinary of [textPart, filePart]) {
-      expect(sessionStartPart.id < ordinary.id).toBe(true);
-      expect(workflowStatePart.id < ordinary.id).toBe(true);
-    }
-
-    // The sort-below assertions above are necessary but NOT sufficient with
-    // this exact fixture: they still pass even if findIdentitySourcePart
-    // picks the file part (the *maximum*-ordinal ordinary part) instead of
-    // the text part, because the wrongly-sourced workflowState ordinal then
-    // collides with the text part's own 12-hex ordinal, and the numeric
-    // slot digit "1" still sorts below the "a" tail character by ASCII
-    // luck. Pin the exact ordinal derived from the text part (the minimum)
-    // so an inverted comparator is actually caught:
-    // sessionStart = 0xb9634c88c001 - 2 = 0xb9634c88bfff,
-    // workflowState = 0xb9634c88c001 - 1 = 0xb9634c88c000.
-    expect(sessionStartPart.id.slice(0, 17)).toBe("prt_b9634c88bfff0");
-    expect(workflowStatePart.id.slice(0, 17)).toBe("prt_b9634c88c0001");
-  });
-});
 
 function setupTrellisProject(): string {
   const dir = mkdtempSync(join(tmpdir(), "trellis-opencode-264-"));
@@ -823,44 +549,60 @@ describe("opencode TrellisContext single-session fallback", () => {
 
 describe("opencode inject-subagent-context (issue #264)", () => {
   let dir: string;
-  let hooks: TaskToolHooks;
+  let toolBefore: ToolBeforeHook;
 
   beforeEach(async () => {
     dir = setupTrellisProject();
-    hooks = (await injectSubagentContextPlugin({
-      directory: dir,
-      platform: "linux",
-      env: {},
-    })) as TaskToolHooks;
+    toolBefore = (await loadSubagentHooks(dir)).toolBefore;
   });
 
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  it("mutates implement prompt using single-session fallback when sessionID misses", async () => {
-    writeSessionFile(dir, "opencode_sole", ".trellis/tasks/demo-task");
-    const output: TaskToolOutput = {
-      args: {
+  function taskEvent(prompt: string, subagentType: string): ToolBeforeEvent {
+    return {
+      tool: "subagent",
+      sessionID: "stranger",
+      agent: "build",
+      input: {
+        agent: subagentType,
+        description: "dispatch",
+        prompt,
+      },
+    };
+  }
+
+  it("ignores the v1 task tool name", async () => {
+    const event: ToolBeforeEvent = {
+      tool: "task",
+      sessionID: "stranger",
+      agent: "build",
+      input: {
         subagent_type: "trellis-implement",
         prompt: "do the implementation",
       },
     };
 
-    await hooks["tool.execute.before"](
-      { tool: "task", sessionID: "stranger" },
-      output,
-    );
+    await toolBefore(event);
 
-    expect(output.args.prompt).toContain("<!-- trellis-hook-injected -->");
-    expect(output.args.prompt).toContain("# Implement Agent Task");
-    expect(output.args.prompt).toContain("Demo PRD");
-    expect(output.args.prompt).toContain("do the implementation");
+    expect(event.input.prompt).toBe("do the implementation");
+  });
+
+  it("mutates implement prompt using single-session fallback when sessionID misses", async () => {
+    writeSessionFile(dir, "opencode_sole", ".trellis/tasks/demo-task");
+    const event = taskEvent("do the implementation", "trellis-implement");
+
+    await toolBefore(event);
+
+    const prompt = event.input.prompt as string;
+    expect(prompt).toContain("<!-- trellis-hook-injected -->");
+    expect(prompt).toContain("# Implement Agent Task");
+    expect(prompt).toContain("Demo PRD");
+    expect(prompt).toContain("do the implementation");
     // Marker must be at the top so generated agent definitions can detect
     // successful injection via a prefix check.
-    expect(output.args.prompt.startsWith("<!-- trellis-hook-injected -->")).toBe(
-      true,
-    );
+    expect(prompt.startsWith("<!-- trellis-hook-injected -->")).toBe(true);
   });
 
   it("inlines JSONL-referenced spec content into the implement prompt", async () => {
@@ -875,42 +617,31 @@ describe("opencode inject-subagent-context (issue #264)", () => {
     );
     writeSessionFile(dir, "opencode_sole", ".trellis/tasks/demo-task");
 
-    const output: TaskToolOutput = {
-      args: {
-        subagent_type: "trellis-implement",
-        prompt: "do the implementation",
-      },
-    };
+    const event = taskEvent("do the implementation", "trellis-implement");
 
-    await hooks["tool.execute.before"](
-      { tool: "task", sessionID: "stranger" },
-      output,
-    );
+    await toolBefore(event);
 
-    expect(output.args.prompt).toContain("<!-- trellis-hook-injected -->");
-    expect(output.args.prompt).toContain("=== .trellis/spec/demo.md ===");
-    expect(output.args.prompt).toContain("UNIQUE_SPEC_MARKER_42");
-    expect(output.args.prompt).toContain("Demo PRD");
+    const prompt = event.input.prompt as string;
+    expect(prompt).toContain("<!-- trellis-hook-injected -->");
+    expect(prompt).toContain("=== .trellis/spec/demo.md ===");
+    expect(prompt).toContain("UNIQUE_SPEC_MARKER_42");
+    expect(prompt).toContain("Demo PRD");
   });
 
   it("mutates check prompt using Active task hint when runtime resolution fails", async () => {
     // No session file → both session lookup and single-session fallback miss.
     // Hint is the only resolver.
-    const output: TaskToolOutput = {
-      args: {
-        subagent_type: "trellis-check",
-        prompt: "Active task: .trellis/tasks/demo-task\n\nplease check",
-      },
-    };
-
-    await hooks["tool.execute.before"](
-      { tool: "task", sessionID: "stranger" },
-      output,
+    const event = taskEvent(
+      "Active task: .trellis/tasks/demo-task\n\nplease check",
+      "trellis-check",
     );
 
-    expect(output.args.prompt).toContain("<!-- trellis-hook-injected -->");
-    expect(output.args.prompt).toContain("# Check Agent Task");
-    expect(output.args.prompt).toContain("Demo PRD");
+    await toolBefore(event);
+
+    const prompt = event.input.prompt as string;
+    expect(prompt).toContain("<!-- trellis-hook-injected -->");
+    expect(prompt).toContain("# Check Agent Task");
+    expect(prompt).toContain("Demo PRD");
   });
 
   it("Active task hint takes precedence over single-session fallback", async () => {
@@ -922,58 +653,39 @@ describe("opencode inject-subagent-context (issue #264)", () => {
     writeFileSync(join(hintTask, "prd.md"), "# Hint PRD\n\nfrom hint");
     writeFileSync(join(hintTask, "implement.jsonl"), "");
 
-    const output: TaskToolOutput = {
-      args: {
-        subagent_type: "trellis-implement",
-        prompt: "Active task: .trellis/tasks/hint-task\n\ngo",
-      },
-    };
-
-    await hooks["tool.execute.before"](
-      { tool: "task", sessionID: "stranger" },
-      output,
+    const event = taskEvent(
+      "Active task: .trellis/tasks/hint-task\n\ngo",
+      "trellis-implement",
     );
 
-    expect(output.args.prompt).toContain("Hint PRD");
-    expect(output.args.prompt).not.toContain("Demo PRD");
+    await toolBefore(event);
+
+    const prompt = event.input.prompt as string;
+    expect(prompt).toContain("Hint PRD");
+    expect(prompt).not.toContain("Demo PRD");
   });
 
   it("emits the trellis-hook-injected marker for research agent too", async () => {
-    const output: TaskToolOutput = {
-      args: {
-        subagent_type: "trellis-research",
-        prompt: "investigate something",
-      },
-    };
+    const event = taskEvent("investigate something", "trellis-research");
 
-    await hooks["tool.execute.before"](
-      { tool: "task", sessionID: "stranger" },
-      output,
-    );
+    await toolBefore(event);
 
-    expect(output.args.prompt).toContain("<!-- trellis-hook-injected -->");
-    expect(output.args.prompt).toContain("# Research Agent Task");
+    const prompt = event.input.prompt as string;
+    expect(prompt).toContain("<!-- trellis-hook-injected -->");
+    expect(prompt).toContain("# Research Agent Task");
   });
 
   it("skips when no task can be resolved through any path", async () => {
-    const output: TaskToolOutput = {
-      args: {
-        subagent_type: "trellis-implement",
-        prompt: "implement without context",
-      },
-    };
+    const event = taskEvent("implement without context", "trellis-implement");
 
-    await hooks["tool.execute.before"](
-      { tool: "task", sessionID: "stranger" },
-      output,
-    );
+    await toolBefore(event);
 
     // Prompt is left untouched when implement/check can't find a task
-    expect(output.args.prompt).toBe("implement without context");
+    expect(event.input.prompt).toBe("implement without context");
   });
 });
 
-describe("opencode messages.transform injection (issue #553)", () => {
+describe("opencode context hook injection (issue #553)", () => {
   let dir: string;
 
   beforeEach(() => {
@@ -984,19 +696,14 @@ describe("opencode messages.transform injection (issue #553)", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  async function loadSessionHooks(): Promise<TransformHooks> {
-    return (await sessionStartPlugin({ directory: dir })) as TransformHooks;
-  }
-
-  async function loadWorkflowHooks(): Promise<TransformHooks> {
-    return (await injectWorkflowStatePlugin({
-      directory: dir,
-    })) as TransformHooks;
-  }
-
-  function ephemeralTexts(message: TransformMessage): string[] {
-    return message.parts
-      .filter(part => part.synthetic === true && typeof part.text === "string")
+  function ephemeralTexts(message: V2Message): string[] {
+    // Ephemeral parts are the first N text parts, N tracked in message
+    // metadata (see context-visibility.js).
+    const trellis = (message.metadata?.trellis ?? {}) as Record<string, unknown>;
+    const count =
+      typeof trellis.ephemeralParts === "number" ? trellis.ephemeralParts : 0;
+    return message.content
+      .slice(0, count)
       .map(part => part.text as string);
   }
 
@@ -1005,118 +712,118 @@ describe("opencode messages.transform injection (issue #553)", () => {
       ["sessionStart", "workflowState"],
       ["workflowState", "sessionStart"],
     ]) {
-      const earlier = userTurn("old prompt", {
-        sessionID: "main-session",
-        messageID: "message-old",
-      });
-      const ordinary = createUserTextPart(
-        "ordinary user prompt",
-        "main-session",
-        "message-new",
-      );
-      ordinary.metadata = { user: { preserved: true } };
-      const latest: TransformMessage = {
-        info: { role: "user", sessionID: "main-session", agent: "build" },
-        parts: [structuredClone(ordinary)],
+      const earlier = userTurn("old prompt", { messageID: "message-old" });
+      const latest: V2Message = {
+        id: "message-new",
+        role: "user",
+        content: [{ type: "text", text: "ordinary user prompt" }],
       };
-      const originalEarlierParts = earlier.parts;
-      const originalLatestParts = latest.parts;
-      const messages: TransformMessage[] = [
+      const originalEarlierContent = earlier.content;
+      const originalLatestContent = latest.content;
+      const event = contextEvent([
         earlier,
-        { info: { role: "assistant", sessionID: "main-session" }, parts: [] },
+        { role: "assistant", content: [] },
         latest,
-      ];
-      const sessionHooks = await loadSessionHooks();
-      const workflowHooks = await loadWorkflowHooks();
+      ]);
+      const sessionHook = await loadSessionContextHook(dir);
+      const workflowHook = await loadWorkflowContextHook(dir);
 
       for (const kind of order) {
-        const hooks = kind === "sessionStart" ? sessionHooks : workflowHooks;
-        await hooks[MESSAGES_TRANSFORM_HOOK]({}, { messages });
+        const hook = kind === "sessionStart" ? sessionHook : workflowHook;
+        await hook(event);
       }
 
-      expect(messages[0]).toBe(earlier);
-      expect(messages[0].parts).toBe(originalEarlierParts);
-      expect(originalLatestParts).toEqual([ordinary]);
-      expect(messages[2]).not.toBe(latest);
-      const texts = ephemeralTexts(messages[2]);
+      expect(event.messages[0]).toBe(earlier);
+      expect(event.messages[0].content).toBe(originalEarlierContent);
+      expect(originalLatestContent).toEqual([
+        { type: "text", text: "ordinary user prompt" },
+      ]);
+      const injected = event.messages[2];
+      expect(injected).not.toBe(latest);
+      const texts = ephemeralTexts(injected);
       expect(texts.some(text => text.startsWith("<session-context>"))).toBe(
         true,
       );
       expect(texts.some(text => text.startsWith("<workflow-state>"))).toBe(
         true,
       );
-      expect(messages[2].parts.at(-1)).toEqual(ordinary);
+      expect(injected.content.at(-1)).toEqual({
+        type: "text",
+        text: "ordinary user prompt",
+      });
     }
   });
 
   it("prepends ephemeral text onto attachment-only latest user messages", async () => {
-    const attachment: ChatMessagePart = {
-      id: "prt_000000000010abcdefghijklmn",
-      sessionID: "main-session",
-      messageID: "attachment-only-message",
-      type: "file",
-      mime: "application/pdf",
+    const attachment: Record<string, unknown> = {
+      type: "media",
+      media: { source: { type: "url", url: "https://example.com/report.pdf" } },
       filename: "report.pdf",
     };
-    const latest: TransformMessage = {
-      info: { role: "user", sessionID: "main-session", agent: "build" },
-      parts: [structuredClone(attachment)],
+    const latest: V2Message = {
+      id: "attachment-only-message",
+      role: "user",
+      content: [attachment],
     };
-    const originalParts = latest.parts;
-    const messages = [latest];
-    const sessionHooks = await loadSessionHooks();
-    const workflowHooks = await loadWorkflowHooks();
-    await workflowHooks[MESSAGES_TRANSFORM_HOOK]({}, { messages });
-    await sessionHooks[MESSAGES_TRANSFORM_HOOK]({}, { messages });
+    const originalContent = latest.content;
+    const event = contextEvent([latest]);
+    const sessionHook = await loadSessionContextHook(dir);
+    const workflowHook = await loadWorkflowContextHook(dir);
+    await workflowHook(event);
+    await sessionHook(event);
 
-    expect(originalParts).toEqual([attachment]);
-    const texts = ephemeralTexts(messages[0]);
+    expect(originalContent).toEqual([attachment]);
+    const texts = ephemeralTexts(event.messages[0]);
     expect(texts.some(text => text.startsWith("<session-context>"))).toBe(true);
     expect(texts.some(text => text.startsWith("<workflow-state>"))).toBe(true);
-    expect(messages[0].parts.at(-1)).toEqual(attachment);
+    expect(event.messages[0].content.at(-1)).toEqual(attachment);
   });
 
-  it("injects without a persisted part identity", async () => {
-    const sessionHooks = await loadSessionHooks();
-    const workflowHooks = await loadWorkflowHooks();
-    const latest: TransformMessage = {
-      info: { role: "user", sessionID: "main-session", agent: "build" },
-      parts: [{ type: "text", text: "original" }],
+  it("injects onto messages without a message id", async () => {
+    const sessionHook = await loadSessionContextHook(dir);
+    const workflowHook = await loadWorkflowContextHook(dir);
+    const latest: V2Message = {
+      role: "user",
+      content: [{ type: "text", text: "original" }],
     };
-    const originalParts = latest.parts;
-    const messages = [latest];
-    await sessionHooks[MESSAGES_TRANSFORM_HOOK]({}, { messages });
-    await workflowHooks[MESSAGES_TRANSFORM_HOOK]({}, { messages });
-    expect(originalParts).toEqual([{ type: "text", text: "original" }]);
-    expect(ephemeralTexts(messages[0]).length).toBe(2);
-    expect(messages[0].parts.at(-1)).toEqual({ type: "text", text: "original" });
+    const originalContent = latest.content;
+    const event = contextEvent([latest]);
+    await sessionHook(event);
+    await workflowHook(event);
+    expect(originalContent).toEqual([{ type: "text", text: "original" }]);
+    expect(ephemeralTexts(event.messages[0])).toHaveLength(2);
+    expect(event.messages[0].content.at(-1)).toEqual({
+      type: "text",
+      text: "original",
+    });
   });
 
   it("checks the skip keyword only in ordinary user text", async () => {
-    const hooks = await loadWorkflowHooks();
-    const ordinary = createUserTextPart("ordinary prompt");
-    const latest: TransformMessage = {
-      info: { role: "user", sessionID: "main-session", agent: "build" },
-      parts: [
-        {
-          type: "text",
-          text: "machine context containing no-trellis",
-          synthetic: true,
-        },
-        structuredClone(ordinary),
+    const hook = await loadWorkflowContextHook(dir);
+    const latest: V2Message = {
+      role: "user",
+      content: [
+        { type: "text", text: "machine context containing no-trellis" },
+        { type: "text", text: "ordinary prompt" },
       ],
+      metadata: { trellis: { ephemeralParts: 1 } },
     };
-    const messages = [latest];
-    await hooks[MESSAGES_TRANSFORM_HOOK]({}, { messages });
-    expect(ephemeralTexts(messages[0]).some(text =>
-      text.startsWith("<workflow-state>"),
-    )).toBe(true);
-    expect(messages[0].parts.at(-1)).toEqual(ordinary);
+    const event = contextEvent([latest]);
+    await hook(event);
+    expect(
+      ephemeralTexts(event.messages[0]).some(text =>
+        text.startsWith("<workflow-state>"),
+      ),
+    ).toBe(true);
+    expect(event.messages[0].content.at(-1)).toEqual({
+      type: "text",
+      text: "ordinary prompt",
+    });
   });
 
   it("keeps both plugins disabled by their existing environment gates", async () => {
-    const sessionHooks = await loadSessionHooks();
-    const workflowHooks = await loadWorkflowHooks();
+    const sessionHook = await loadSessionContextHook(dir);
+    const workflowHook = await loadWorkflowContextHook(dir);
     const cases = [
       ["TRELLIS_HOOKS", "0"],
       ["TRELLIS_DISABLE_HOOKS", "1"],
@@ -1127,13 +834,13 @@ describe("opencode messages.transform injection (issue #553)", () => {
       const previous = process.env[key];
       process.env[key] = value;
       try {
-        for (const hooks of [sessionHooks, workflowHooks]) {
+        for (const hook of [sessionHook, workflowHook]) {
           const latest = userTurn("original");
-          const original = latest.parts;
-          const messages = [latest];
-          await hooks[MESSAGES_TRANSFORM_HOOK]({}, { messages });
-          expect(messages[0]).toBe(latest);
-          expect(messages[0].parts).toBe(original);
+          const original = latest.content;
+          const event = contextEvent([latest]);
+          await hook(event);
+          expect(event.messages[0]).toBe(latest);
+          expect(event.messages[0].content).toBe(original);
         }
       } finally {
         if (previous === undefined) Reflect.deleteProperty(process.env, key);
@@ -1142,63 +849,63 @@ describe("opencode messages.transform injection (issue #553)", () => {
     }
   });
 
-  it("session-start.js early-returns when the latest user agent is a trellis sub-agent", async () => {
-    const hooks = await loadSessionHooks();
-    const latest = userTurn("original", { agent: "trellis-implement" });
-    const original = latest.parts;
-    const messages = [latest];
-    await hooks[MESSAGES_TRANSFORM_HOOK]({}, { messages });
-    expect(messages[0]).toBe(latest);
-    expect(messages[0].parts).toBe(original);
+  it("session-start.js early-returns when the event agent is a trellis sub-agent", async () => {
+    const hook = await loadSessionContextHook(dir);
+    const latest = userTurn("original");
+    const original = latest.content;
+    const event = contextEvent([latest], { agent: "trellis-implement" });
+    await hook(event);
+    expect(event.messages[0]).toBe(latest);
+    expect(event.messages[0].content).toBe(original);
   });
 
   it("session-start.js skips trellis-check and trellis-research", async () => {
-    const hooks = await loadSessionHooks();
+    const hook = await loadSessionContextHook(dir);
     for (const agent of ["trellis-check", "trellis-research"]) {
-      const latest = userTurn("untouched", { agent });
-      const messages = [latest];
-      await hooks[MESSAGES_TRANSFORM_HOOK]({}, { messages });
-      expect(messages[0].parts[0].text).toBe("untouched");
+      const latest = userTurn("untouched");
+      const event = contextEvent([latest], { agent });
+      await hook(event);
+      expect(event.messages[0].content[0].text).toBe("untouched");
     }
   });
 
-  it("inject-workflow-state.js early-returns when the latest user agent is a trellis sub-agent", async () => {
-    const hooks = await loadWorkflowHooks();
-    const latest = userTurn("original", { agent: "trellis-implement" });
-    const original = latest.parts;
-    const messages = [latest];
-    await hooks[MESSAGES_TRANSFORM_HOOK]({}, { messages });
-    expect(messages[0]).toBe(latest);
-    expect(messages[0].parts).toBe(original);
+  it("inject-workflow-state.js early-returns when the event agent is a trellis sub-agent", async () => {
+    const hook = await loadWorkflowContextHook(dir);
+    const latest = userTurn("original");
+    const original = latest.content;
+    const event = contextEvent([latest], { agent: "trellis-implement" });
+    await hook(event);
+    expect(event.messages[0]).toBe(latest);
+    expect(event.messages[0].content).toBe(original);
   });
 
   it("inject-workflow-state.js still injects breadcrumb for main-session turns", async () => {
-    const hooks = await loadWorkflowHooks();
+    const hook = await loadWorkflowContextHook(dir);
     const latest = userTurn("user prompt");
-    const original = latest.parts[0];
-    const messages = [latest];
-    await hooks[MESSAGES_TRANSFORM_HOOK]({}, { messages });
-    expect(messages[0].parts[0].text).toContain("<workflow-state>");
-    expect(messages[0].parts[0].synthetic).toBe(true);
-    expect(messages[0].parts[1]).toEqual(original);
+    const original = latest.content[0];
+    const event = contextEvent([latest]);
+    await hook(event);
+    const injected = event.messages[0];
+    expect(injected.content[0].text).toContain("<workflow-state>");
+    expect(injected.content[1]).toEqual(original);
   });
 
   it("inject-workflow-state.js skips injection when the prompt contains the default skip keyword", async () => {
-    const hooks = await loadWorkflowHooks();
+    const hook = await loadWorkflowContextHook(dir);
     const latest = userTurn("no-trellis what does this regex do");
-    const original = latest.parts;
-    const messages = [latest];
-    await hooks[MESSAGES_TRANSFORM_HOOK]({}, { messages });
-    expect(messages[0]).toBe(latest);
-    expect(messages[0].parts).toBe(original);
+    const original = latest.content;
+    const event = contextEvent([latest]);
+    await hook(event);
+    expect(event.messages[0]).toBe(latest);
+    expect(event.messages[0].content).toBe(original);
   });
 
   it("inject-workflow-state.js does not skip on 'no-trellisfoo' (word-boundary negative)", async () => {
-    const hooks = await loadWorkflowHooks();
+    const hook = await loadWorkflowContextHook(dir);
     const latest = userTurn("no-trellisfoo is a strange word");
-    const messages = [latest];
-    await hooks[MESSAGES_TRANSFORM_HOOK]({}, { messages });
-    expect(messages[0].parts[0].text).toContain("<workflow-state>");
+    const event = contextEvent([latest]);
+    await hook(event);
+    expect(event.messages[0].content[0].text).toContain("<workflow-state>");
   });
 
   it("inject-workflow-state.js honors a custom prompt_injection.skip_keyword", async () => {
@@ -1206,20 +913,21 @@ describe("opencode messages.transform injection (issue #553)", () => {
       join(dir, ".trellis", "config.yaml"),
       ["prompt_injection:", '  skip_keyword: "off-topic"'].join("\n"),
     );
-    const hooks = await loadWorkflowHooks();
+    const hook = await loadWorkflowContextHook(dir);
 
     const skipped = userTurn("off-topic question");
-    const skippedMessages = [skipped];
-    await hooks[MESSAGES_TRANSFORM_HOOK]({}, { messages: skippedMessages });
-    expect(skippedMessages[0]).toBe(skipped);
+    const skippedEvent = contextEvent([skipped]);
+    await hook(skippedEvent);
+    expect(skippedEvent.messages[0]).toBe(skipped);
 
     const notSkipped = userTurn("no-trellis question", {
-      sessionID: "main-session-2",
       messageID: "message-custom-keyword",
     });
-    const notSkippedMessages = [notSkipped];
-    await hooks[MESSAGES_TRANSFORM_HOOK]({}, { messages: notSkippedMessages });
-    expect(notSkippedMessages[0].parts[0].text).toContain("<workflow-state>");
+    const notSkippedEvent = contextEvent([notSkipped]);
+    await hook(notSkippedEvent);
+    expect(notSkippedEvent.messages[0].content[0].text).toContain(
+      "<workflow-state>",
+    );
   });
 
   it("inject-workflow-state.js disables the escape hatch with skip_keyword: \"\"", async () => {
@@ -1227,11 +935,11 @@ describe("opencode messages.transform injection (issue #553)", () => {
       join(dir, ".trellis", "config.yaml"),
       ["prompt_injection:", '  skip_keyword: ""'].join("\n"),
     );
-    const hooks = await loadWorkflowHooks();
+    const hook = await loadWorkflowContextHook(dir);
     const latest = userTurn("no-trellis question");
-    const messages = [latest];
-    await hooks[MESSAGES_TRANSFORM_HOOK]({}, { messages });
-    expect(messages[0].parts[0].text).toContain("<workflow-state>");
+    const event = contextEvent([latest]);
+    await hook(event);
+    expect(event.messages[0].content[0].text).toContain("<workflow-state>");
   });
 });
 
@@ -1239,21 +947,30 @@ describe("opencode ephemeral transform helpers", () => {
   it("clones only the latest user message when prepending text", () => {
     const earlier = userTurn("old");
     const latest = userTurn("new", { messageID: "message-b" });
-    const messages = [
-      earlier,
-      { info: { role: "assistant" }, parts: [] },
-      latest,
-    ];
+    const messages = [earlier, { role: "assistant", content: [] }, latest];
     expect(prependEphemeralText(messages, "ephemeral")).toBe(true);
     expect(messages[0]).toBe(earlier);
     expect(messages[2]).not.toBe(latest);
-    expect(latest.parts).toHaveLength(1);
-    expect(messages[2].parts[0]).toEqual({
+    expect(latest.content).toHaveLength(1);
+    expect(messages[2].content[0]).toEqual({ type: "text", text: "ephemeral" });
+    expect(messages[2].content[1]).toBe(latest.content[0]);
+    expect(messages[2].metadata).toEqual({ trellis: { ephemeralParts: 1 } });
+  });
+
+  it("tracks stacked ephemeral parts so findUserTextPart skips them", () => {
+    const latest = userTurn("user prompt");
+    const messages = [latest];
+    expect(prependEphemeralText(messages, "first")).toBe(true);
+    expect(prependEphemeralText(messages, "second")).toBe(true);
+    expect(messages[0].content.map(part => part.text)).toEqual([
+      "second",
+      "first",
+      "user prompt",
+    ]);
+    expect(findUserTextPart(messages[0])).toEqual({
       type: "text",
-      text: "ephemeral",
-      synthetic: true,
+      text: "user prompt",
     });
-    expect(messages[2].parts[1]).toBe(latest.parts[0]);
   });
 });
 
@@ -1286,22 +1003,19 @@ describe("opencode context injection limits (issue #441)", () => {
 
   async function runImplementHook(): Promise<string> {
     writeSessionFile(dir, "opencode_sole", ".trellis/tasks/demo-task");
-    const hooks = (await injectSubagentContextPlugin({
-      directory: dir,
-      platform: "linux",
-      env: {},
-    })) as TaskToolHooks;
-    const output: TaskToolOutput = {
-      args: {
-        subagent_type: "trellis-implement",
+    const { toolBefore } = await loadSubagentHooks(dir);
+    const event: ToolBeforeEvent = {
+      tool: "subagent",
+      sessionID: "stranger",
+      agent: "build",
+      input: {
+        agent: "trellis-implement",
+        description: "dispatch",
         prompt: "do the implementation",
       },
     };
-    await hooks["tool.execute.before"](
-      { tool: "task", sessionID: "stranger" },
-      output,
-    );
-    return output.args.prompt ?? "";
+    await toolBefore(event);
+    return (event.input.prompt as string) ?? "";
   }
 
   describe("truncateUtf8", () => {
@@ -1434,7 +1148,7 @@ describe("opencode context injection limits (issue #441)", () => {
       );
       expect(prompt).not.toContain("=== design.png ===");
       expect(prompt).not.toContain("=== invalid.bin ===");
-      expect(prompt).not.toContain("\u0000");
+      expect(prompt).not.toContain(String.fromCharCode(0));
       expect(prompt).not.toContain("�");
     });
 
@@ -1618,5 +1332,55 @@ describe("opencode context injection limits (issue #441)", () => {
       );
       expect(prompt).not.toContain("IGNORED_TXT_CONTENT");
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dogfood parity — the repo's own committed .opencode/ copies must match the
+// shipped template bytes (spec: workflow-state-contract.md §6). These are the
+// files the maintainers' own OpenCode loads; silent drift here means Trellis
+// development runs on stale plugins while tests exercise the new ones.
+// ---------------------------------------------------------------------------
+
+describe("opencode dogfood parity", () => {
+  const MANAGED_FILES = [
+    ".opencode/plugins/session-start.js",
+    ".opencode/plugins/inject-workflow-state.js",
+    ".opencode/plugins/inject-subagent-context.js",
+    ".opencode/lib/context-visibility.js",
+    ".opencode/lib/session-utils.js",
+    ".opencode/lib/trellis-context.js",
+    ".opencode/agents/trellis-check.md",
+    ".opencode/agents/trellis-implement.md",
+    ".opencode/agents/trellis-research.md",
+  ];
+
+  it("collectOpenCodeTemplates ships every managed plugin/lib/agent file", () => {
+    const files = collectOpenCodeTemplates();
+    for (const relPath of MANAGED_FILES) {
+      expect(files.has(relPath), `${relPath} missing from shipped set`).toBe(
+        true,
+      );
+    }
+    // v2 reads no .opencode/package.json — it must not come back.
+    expect(files.has(".opencode/package.json")).toBe(false);
+  });
+
+  it("dogfood .opencode/ copies match the shipped template bytes", () => {
+    const testDir = dirname(fileURLToPath(import.meta.url));
+    // packages/cli/test/templates → repo root
+    const repoRoot = resolve(testDir, "../../../..");
+    const files = collectOpenCodeTemplates();
+    for (const relPath of MANAGED_FILES) {
+      const shipped = files.get(relPath);
+      if (shipped === undefined) {
+        throw new Error(`${relPath} missing from collectOpenCodeTemplates()`);
+      }
+      const dogfood = readFileSync(join(repoRoot, relPath), "utf-8");
+      expect(
+        dogfood,
+        `${relPath} dogfood copy drifted from the template — re-run trellis update or re-sync .opencode/`,
+      ).toBe(shipped);
+    }
   });
 });

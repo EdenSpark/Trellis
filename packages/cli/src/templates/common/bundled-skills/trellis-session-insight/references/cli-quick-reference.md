@@ -55,7 +55,7 @@ trellis mem projects
 
 ## Caveats
 
-- **OpenCode adapter is a stub on `0.6.0-beta.*`.** When `--platform` resolves to OpenCode (or `all` and OpenCode would be included), `mem` prints a one-line "reader unavailable" notice and continues with the other platforms. Don't promise OpenCode coverage in your reply until the adapter ships.
+- **OpenCode is fully covered.** `mem` reads `~/.local/share/opencode/opencode.db` directly (read-only, zero-dependency SQLite parser) and supports both schema generations: v1 (`session` / `message` / `part`) and v2 (`session_v2` / `session_message`). While a v1→v2 import is unfinished, both generations are read and de-duplicated by session id. `--include-children` merges OpenCode sub-agent sessions via `parent_id`.
 - **`--platform devin` is Cognition Devin CLI** (`~/.local/share/devin/cli/sessions.db`). It is not `trellis init --devin` (Devin Desktop / Cascade) and not Factory Droid.
 - **`--phase` slicing depends on `task.py create` / `task.py start` invocations appearing in the recorded bash calls of the session.** Sessions where the user ran `task.py` from a different terminal — outside the recorded AI loop — will not have phase boundaries. `--phase all` is the safe fallback.
 - **`mem` indexes platform JSONL files directly.** If the user has cleared their Claude / Codex / Pi session storage, `mem` cannot recover what is no longer on disk.

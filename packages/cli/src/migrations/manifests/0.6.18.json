@@ -1,0 +1,22 @@
+{
+  "version": "0.6.18",
+  "description": "OpenCode v2 support: plugins rewritten for the new plugin API, v2 agent frontmatter, mem adapter reads the v2 session schema",
+  "breaking": true,
+  "recommendMigrate": true,
+  "changelog": "**Enhancements:**\n- feat(cli): OpenCode v2 support. The `.opencode/plugins/` templates are rewritten for the v2 plugin API (`{ id, setup(ctx) }` entries, `ctx.session.hook(\"context\")`, `ctx.tool.hook(\"execute.before\")`) and require OpenCode v2; v1 OpenCode no longer runs Trellis plugins. Shell context injection now prefixes commands via the renamed `shell` tool, and sub-agent dispatch interception uses the renamed `subagent` tool.\n- feat(cli): OpenCode agent templates migrate to the v2 `permissions` array frontmatter (`shell`/`edit` actions, `exa_*`/`chrome-devtools_*` MCP patterns).\n- feat(cli): `trellis init` and `trellis update` print an upgrade notice when the installed `opencode` binary is v1 (non-blocking).\n- feat(core): `trellis mem --platform opencode` reads the v2 session schema (`session_v2`/`session_message`) with automatic v1 fallback and dual-read while a v1→v2 migration is unfinished; OpenCode session recall is available again.\n\n**Internal:**\n- `.opencode/package.json` is no longer shipped (OpenCode v2 does not read it); a `safe-file-delete` migration removes pristine copies.",
+  "migrationGuide": "1. Upgrade OpenCode to v2 (`opencode --version` should print 2.x; see https://opencode.ai/docs/migrate-v1/).\n2. Run `trellis update --migrate`.\n3. Trellis plugins, lib helpers, and agent templates under `.opencode/` are replaced with v2-compatible versions automatically when unmodified. The obsolete `.opencode/package.json` is deleted (OpenCode v2 does not read it; the plugins no longer import `@opencode-ai/plugin`).\n4. OpenCode v1 is no longer supported: the v2 plugin implementations do not run on v1. Stay on Trellis 0.6.17 if you must keep OpenCode v1.",
+  "aiInstructions": "When assisting with this migration: verify `opencode --version` prints 2.x before running `trellis update --migrate`. The `.opencode/plugins/*.js`, `.opencode/lib/*.js`, and `.opencode/agents/trellis-*.md` files are Trellis-managed; accept overwrite prompts for them. If the user customized these files, port their changes onto the v2 plugin API (`ctx.session.hook(\"context\")` replaces `experimental.chat.messages.transform`; `ctx.tool.hook(\"execute.before\")` replaces `tool.execute.before`; the dispatch tool is `subagent`, not `task`; the shell tool is `shell`, not `bash`). Do not restore `.opencode/package.json`.",
+  "migrations": [
+    {
+      "type": "safe-file-delete",
+      "from": ".opencode/package.json",
+      "description": "OpenCode v2 does not read .opencode/package.json; the plugins no longer import @opencode-ai/plugin",
+      "reason": "Trellis 0.6.18 ships v2-only plugins with no external dependencies, making this file dead weight.",
+      "allowed_hashes": [
+        "4b155e844fde1467e331e898b378e66820c323110ef1ecae6fce3844358535ea",
+        "6867538b2f6025286a70c943d15db4191d2412daa8bf7431a846b00c863f26b8"
+      ]
+    }
+  ],
+  "notes": "OpenCode v2 is required. Upgrade OpenCode first (https://opencode.ai/docs/migrate-v1/), then run `trellis update --migrate`. The three `.opencode/plugins/*.js` files, `lib/*.js`, and agent frontmatter are replaced automatically for unmodified files (hash-matched); the obsolete `.opencode/package.json` is removed by the migration. If you customized any of these files, review the confirm prompts."
+}

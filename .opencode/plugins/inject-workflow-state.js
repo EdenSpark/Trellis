@@ -4,10 +4,11 @@
  *
  * Per-turn UserPromptSubmit equivalent for OpenCode.
  *
- * On every model request, inject a short <workflow-state> breadcrumb
- * into the in-memory copy of the latest user message via
- * `experimental.chat.messages.transform`. Stored history and the TUI
- * are not modified (issue #553). Breadcrumb text is pulled exclusively
+ * On every agent-loop model request, inject a short <workflow-state>
+ * breadcrumb into the in-memory copy of the latest user message via the
+ * v2 `context` session hook. Changes affect only the outgoing model call;
+ * stored history and the TUI are not modified (issue #553). Breadcrumb
+ * text is pulled exclusively
  * from the project's workflow.md [workflow-state:STATUS] tag blocks —
  * workflow.md is the single source of truth. There are no fallback
  * tables in this plugin: when workflow.md is missing or a tag is
@@ -24,9 +25,7 @@
 import { existsSync, readFileSync } from "fs"
 import { join } from "path"
 import {
-  MESSAGES_TRANSFORM_HOOK,
   latestUserPromptText,
-  platformInputFromMessages,
   prependEphemeralText,
 } from "../lib/context-visibility.js"
 import { TrellisContext, debugLog, isTrellisSubagent } from "../lib/trellis-context.js"
@@ -178,63 +177,69 @@ function buildBreadcrumb(id, status, templates) {
   return `<workflow-state>\n${header}\n${body}\n</workflow-state>`
 }
 
-// OpenCode 1.2.x expects plugins to be factory functions (see inject-subagent-context.js comment).
-export default async ({ directory }) => {
-  const ctx = new TrellisContext(directory)
-  debugLog("workflow-state", "Plugin loaded, directory:", directory)
+// OpenCode v2 plugin shape: default-export `{ id, async setup(ctx) }`.
+// Deliberately does NOT import `@opencode/plugin` — the shipped template has
+// no package.json / node_modules, so a bare import would fail to resolve.
+export default {
+  id: "trellis.workflow-state",
+  async setup(ctx) {
+    const directory = ctx.location.directory
+    const trellis = new TrellisContext(directory)
+    debugLog("workflow-state", "Plugin loaded, directory:", directory)
 
-  return {
-      [MESSAGES_TRANSFORM_HOOK]: async (_input, output) => {
-        try {
-          const messages = output?.messages
-          const platformInput = platformInputFromMessages(messages)
-          // Skip Trellis sub-agent turns — the per-turn breadcrumb is for the
-          // main session only; sub-agent context comes from the parent's
-          // tool.execute.before injection.
-          if (isTrellisSubagent(platformInput)) {
-            debugLog("workflow-state", "Skipping trellis subagent turn:", platformInput?.agent)
-            return
-          }
-          if (process.env.TRELLIS_HOOKS === "0" || process.env.TRELLIS_DISABLE_HOOKS === "1") {
-            return
-          }
-          if (process.env.OPENCODE_NON_INTERACTIVE === "1") {
-            return
-          }
-          if (!ctx.isTrellisProject()) {
-            return
-          }
-
-          const originalText = latestUserPromptText(messages)
-
-          // Escape hatch (issue #427): user prompt contains the skip keyword
-          // as a standalone word — emit nothing for this turn only.
-          if (promptHasSkipKeyword(originalText, readSkipKeyword(directory))) {
-            debugLog("workflow-state", "Skipping turn: skip keyword present in prompt")
-            return
-          }
-
-          const templates = loadBreadcrumbs(directory)
-          const task = getActiveTask(ctx, platformInput)
-          const breadcrumb = task
-            ? buildBreadcrumb(task.id, task.status, templates, task.source)
-            : buildBreadcrumb(null, "no_task", templates)
-
-          prependEphemeralText(messages, breadcrumb)
-          debugLog(
-            "workflow-state",
-            "Injected breadcrumb for task",
-            task ? task.id : "none",
-            "status",
-            task ? task.status : "no_task",
-          )
-        } catch (error) {
-          debugLog(
-            "workflow-state",
-            "Error in messages.transform:",
-            error instanceof Error ? error.message : String(error),
-          )
+    const registration = await ctx.session.hook("context", async (event) => {
+      try {
+        // Skip Trellis sub-agent turns — the per-turn breadcrumb is for the
+        // main session only; sub-agent context comes from the parent's
+        // tool execute.before injection. v2 gives `agent` directly on the
+        // event (no more platformInputFromMessages hack).
+        if (isTrellisSubagent(event)) {
+          debugLog("workflow-state", "Skipping trellis subagent turn:", event.agent)
+          return
         }
-      },
-  }
+        if (process.env.TRELLIS_HOOKS === "0" || process.env.TRELLIS_DISABLE_HOOKS === "1") {
+          return
+        }
+        if (process.env.OPENCODE_NON_INTERACTIVE === "1") {
+          return
+        }
+        if (!trellis.isTrellisProject()) {
+          return
+        }
+
+        const originalText = latestUserPromptText(event.messages)
+
+        // Escape hatch (issue #427): user prompt contains the skip keyword
+        // as a standalone word — emit nothing for this turn only.
+        if (promptHasSkipKeyword(originalText, readSkipKeyword(directory))) {
+          debugLog("workflow-state", "Skipping turn: skip keyword present in prompt")
+          return
+        }
+
+        const platformInput = { sessionID: event.sessionID, agent: event.agent }
+        const templates = loadBreadcrumbs(directory)
+        const task = getActiveTask(trellis, platformInput)
+        const breadcrumb = task
+          ? buildBreadcrumb(task.id, task.status, templates, task.source)
+          : buildBreadcrumb(null, "no_task", templates)
+
+        prependEphemeralText(event.messages, breadcrumb)
+        debugLog(
+          "workflow-state",
+          "Injected breadcrumb for task",
+          task ? task.id : "none",
+          "status",
+          task ? task.status : "no_task",
+        )
+      } catch (error) {
+        debugLog(
+          "workflow-state",
+          "Error in context hook:",
+          error instanceof Error ? error.message : String(error),
+        )
+      }
+    })
+
+    return () => registration.dispose()
+  },
 }

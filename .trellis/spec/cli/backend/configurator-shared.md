@@ -16,7 +16,7 @@ For per-platform integration mechanics (which directory each platform writes, wh
 
 A helper belongs in `shared.ts` when (a) two or more configurators need the same behavior **or** (b) a single configurator needs the helper in **both** the init write path and the update collect path — putting it in shared.ts forces both to call the same code.
 
-A helper does **not** belong in `shared.ts` when it encodes platform-specific formatting (e.g. Codex TOML agents, OpenCode plugin JSON, Kiro JSON agents). Those stay in the per-platform configurator.
+A helper does **not** belong in `shared.ts` when it encodes platform-specific formatting (e.g. Codex TOML agents, Snow hook JSON, Kiro JSON agents). Those stay in the per-platform configurator.
 
 ---
 

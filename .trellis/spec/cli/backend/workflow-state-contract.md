@@ -107,51 +107,61 @@ Both regexes MUST use the `\1` backreference variant — `[workflow-state:([A-Za
 
    When adding a new hook-capable platform whose per-turn event name is not
    `UserPromptSubmit`, extend `_detect_platform()` and the `hook_event_name`
-   selector in `inject-workflow-state.py` (and the OpenCode `.js` plugin if
-   the new platform shares its transform envelope). Do NOT hardcode
+   selector in `inject-workflow-state.py`. (The OpenCode `.js` plugin does
+   not use this JSON envelope — it mutates `event.messages` directly in the
+   v2 `context` hook, so it needs no `hookEventName` echo.) Do NOT hardcode
    `UserPromptSubmit` at any new emission site.
 
 ---
 
-## OpenCode messages.transform contract
+## OpenCode `context` hook contract
 
 ### 1. Scope / Trigger
 
 OpenCode SessionStart and per-turn workflow-state plugins inject Trellis
-context through `experimental.chat.messages.transform`. That hook runs on
-the in-memory transcript OpenCode is about to convert to model messages
-(`SessionPrompt.run` and compaction). It does not write SQLite / TUI /
-Web history. `chat.message` remains the persist path and must not be used
-for Trellis context (issue #553, replacing the persisted-synthetic-part
-contract from #524).
+context through the v2 session hook `ctx.session.hook("context", ...)`. That
+hook runs on the in-memory message list OpenCode is about to send to the
+model on every agent-loop request. Documented v2 semantics: changes affect
+only the outgoing model call, not persisted history — SQLite / TUI / Web
+history stay untouched (issue #553, replacing the persisted-synthetic-part
+contract from #524). Any persist-path API must not be used for Trellis
+context.
 
 ### 2. Signatures
 
 - `findLatestUserMessageIndex(messages) -> number`
 - `latestUserPromptText(messages) -> string`
-- `platformInputFromMessages(messages) -> { sessionID, agent } | null`
+- `transcriptHasAssistantMessage(messages) -> boolean`
 - `prependEphemeralText(messages, text) -> boolean`
-- Hook name: `experimental.chat.messages.transform`
-- Hook input from OpenCode is `{}`; session identity is read from the
-  latest user message `info`.
+- Hook registration: `await ctx.session.hook("context", async (event) => …)`
+- The v2 event carries `sessionID`, `agent`, `messages`, and `system`
+  directly — v1's `platformInputFromMessages` message-scanning hack is gone;
+  plugins build `{ sessionID: event.sessionID, agent: event.agent }`.
+- v2 hook messages are flat `{ id?, role, content: Part[], metadata? }`
+  objects (`SessionRequestMessage`); text parts are `{ type: "text", text }`.
+  Parts carry no persisted identity (no `prt_` ids), so the v1
+  persisted-part machinery has no v2 counterpart. Ephemeral-injection
+  bookkeeping lives in `message.metadata.trellis.ephemeralParts` — metadata
+  is not sent to the model.
 
 ### 3. Contracts
 
-- Only the latest `info.role === "user"` message is cloned. Earlier user
+- Only the latest `role === "user"` message is cloned. Earlier user
   and assistant messages stay the original object references.
-- The clone prepends `{ type: "text", text, synthetic: true }` parts.
-  Ordinary parts on the clone keep their original objects; the original
-  message's `parts` array is not mutated.
-- Injection does not require a persisted `prt_...` identity. Attachment-only
-  latest user messages still receive the ephemeral text parts.
+- The clone prepends `{ type: "text", text }` parts onto a copied `content`
+  array and bumps `metadata.trellis.ephemeralParts`. Ordinary parts on the
+  clone keep their original objects; the original message's `content` array
+  is not mutated.
+- Attachment-only latest user messages still receive the ephemeral text
+  parts.
 - Workflow-state checks the skip keyword only against ordinary user text
-  (`findUserTextPart`), never against ephemeral or stored synthetic parts.
+  (`findUserTextPart`), never against ephemeral parts.
 - SessionStart injects rebuilt compact context onto the latest user message
   every model call. `<first-reply-notice>` is included only when the
-  transcript has no assistant message.
-- Plugin error handling leaves `output.messages` unchanged (prepend is the
+  transcript has no assistant message (`transcriptHasAssistantMessage`).
+- Plugin error handling leaves `event.messages` unchanged (prepend is the
   last step).
-- Trellis sub-agent turns (`info.agent` matching `trellis-implement` /
+- Trellis sub-agent turns (`event.agent` matching `trellis-implement` /
   `trellis-check` / `trellis-research`) skip both plugins.
 
 ### 4. Validation & Error Matrix
@@ -167,12 +177,13 @@ contract from #524).
 ### 5. Good / Base / Bad Cases
 
 - Good: a two-turn transcript's first user message is byte-identical after
-  transform; only the latest user message clone carries `<session-context>`
+  the hook; only the latest user message clone carries `<session-context>`
   and `<workflow-state>`.
 - Base: an attachment-only latest user message gets ephemeral text parts
   prepended; the file part object is unchanged.
-- Bad: mutating `chat.message` `output.parts` persists Trellis context into
-  history and makes revert restore it into the prompt box.
+- Bad: writing Trellis context through any persist-path API stores machine
+  context in OpenCode history and makes revert restore it into the prompt
+  box.
 
 ### 6. Tests Required
 
@@ -183,7 +194,7 @@ contract from #524).
 - SessionStart tests cover first-reply-notice presence vs absence after an
   assistant turn. Workflow tests cover default/custom/disabled skip keywords.
 - Existing hook-disable, non-interactive, and Trellis sub-agent exclusion
-  tests remain mandatory, aimed at the transform hook.
+  tests remain mandatory, aimed at the `context` hook.
 - Template collection tests assert the helper ships through both fresh init
   and `trellis update`; dogfood `.opencode/` copies must match template bytes.
 
@@ -193,7 +204,7 @@ contract from #524).
 
 ```javascript
 parts[0].text = `${breadcrumb}\n\n${parts[0].text}`
-insertSyntheticTextPart(parts, breadcrumb, "workflowState")
+// or injecting via ctx.session.hook("prompt", ...) — the persist path
 ```
 
 Both persist machine context into OpenCode history. The first also rewrites

@@ -2,15 +2,14 @@
 description: |
   Code and tech search expert. Finds files, patterns, and tech solutions, and PERSISTS every finding to the current task's research/ directory. No code modifications outside that directory.
 mode: subagent
-permission:
-  read: allow
-  write: allow
-  edit: allow
-  bash: allow
-  glob: allow
-  grep: allow
-  mcp__exa__*: allow
-  mcp__chrome-devtools__*: allow
+permissions:
+  - { action: read, resource: "*", effect: allow }
+  - { action: edit, resource: "*", effect: allow }
+  - { action: shell, resource: "*", effect: allow }
+  - { action: glob, resource: "*", effect: allow }
+  - { action: grep, resource: "*", effect: allow }
+  - { action: "exa_*", resource: "*", effect: allow }
+  - { action: "chrome-devtools_*", resource: "*", effect: allow }
 ---
 # Research Agent
 

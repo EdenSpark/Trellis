@@ -887,7 +887,7 @@ The first commit (`346003d`) added a `tasksEmpty` fallback only in `init()`'s ma
 4. Source build needs Visual Studio 2017+ Build Tools, which most Windows users don't have installed.
 5. Install fails — **`trellis` itself can no longer be installed at all**.
 
-Time to detect: ~4 hours after publish. Fix: emergency revert in 0.6.0-beta.4 (removed `better-sqlite3`, marked the OpenCode 1.2+ SQLite reader as degraded with a soft-degrade fallback). The OpenCode SQLite section in `commands-mem.md` is now a stub describing the degraded state.
+Time to detect: ~4 hours after publish. Fix: emergency revert in 0.6.0-beta.4 (removed `better-sqlite3`, temporarily soft-degrading the OpenCode reader). The reader has since been rebuilt on the zero-dependency SQLite parser (`core/mem/internal/sqlite-readonly.ts`) and reads both the OpenCode v1 and v2 schemas — see the OpenCode section in `commands-mem.md`. No-native-dep turned out to be the real fix; soft-degrade was only the bridge.
 
 The lesson: **a native dep that fails to install fails the entire CLI**, not just one feature. For a productivity tool, that tradeoff is unacceptable unless the perf benefit is dramatic and unreplaceable.
 
@@ -908,8 +908,8 @@ try {
   nativeReader = (await import("better-sqlite3")).default as NativeReader;
 } catch {
   process.stderr.write(
-    "[trellis] OpenCode 1.2+ SQLite session reader unavailable " +
-    "(better-sqlite3 not installed). Falling back to JSONL-only mode.\n"
+    "[trellis] Optional native backend unavailable " +
+    "(<pkg> not installed). Falling back to the portable path.\n"
   );
 }
 
@@ -920,7 +920,7 @@ if (nativeReader) {
 }
 ```
 
-Cross-reference: future native-dep additions should mirror the soft-degrade pattern used by `commands/mem.ts:opencodeListSessions` (on the `feat/v0.6.0-beta` branch). When the native reader is unavailable, the function returns degraded but non-empty output rather than throwing.
+Cross-reference: the OpenCode session reader no longer demonstrates this pattern — it ships zero native code and parses SQLite with the pure-TS `core/mem/internal/sqlite-readonly.ts`, which is the preferred outcome. The soft-degrade pattern above is the fallback for a future native dep that genuinely cannot be eliminated; when its native reader is unavailable, the load site returns degraded but non-empty output rather than throwing.
 
 #### 3. Test on Windows + restricted network before shipping
 
@@ -981,7 +981,7 @@ If any answer is "no", the dep doesn't ship.
 4. Source build needs Visual Studio 2017+ Build Tools, which most Windows users don't have installed.
 5. Install fails — **`trellis` itself can no longer be installed at all**.
 
-Time to detect: ~4 hours after publish. Fix: emergency revert in 0.6.0-beta.4 (removed `better-sqlite3`, marked the OpenCode 1.2+ SQLite reader as degraded with a soft-degrade fallback). The OpenCode SQLite section in `commands-mem.md` is now a stub describing the degraded state.
+Time to detect: ~4 hours after publish. Fix: emergency revert in 0.6.0-beta.4 (removed `better-sqlite3`, temporarily soft-degrading the OpenCode reader). The reader has since been rebuilt on the zero-dependency SQLite parser (`core/mem/internal/sqlite-readonly.ts`) and reads both the OpenCode v1 and v2 schemas — see the OpenCode section in `commands-mem.md`. No-native-dep turned out to be the real fix; soft-degrade was only the bridge.
 
 The lesson: **a native dep that fails to install fails the entire CLI**, not just one feature. For a productivity tool, that tradeoff is unacceptable unless the perf benefit is dramatic and unreplaceable.
 
@@ -1002,8 +1002,8 @@ try {
   nativeReader = (await import("better-sqlite3")).default as NativeReader;
 } catch {
   process.stderr.write(
-    "[trellis] OpenCode 1.2+ SQLite session reader unavailable " +
-    "(better-sqlite3 not installed). Falling back to JSONL-only mode.\n"
+    "[trellis] Optional native backend unavailable " +
+    "(<pkg> not installed). Falling back to the portable path.\n"
   );
 }
 
@@ -1014,7 +1014,7 @@ if (nativeReader) {
 }
 ```
 
-Cross-reference: future native-dep additions should mirror the soft-degrade pattern used by `commands/mem.ts:opencodeListSessions` (on the `feat/v0.6.0-beta` branch). When the native reader is unavailable, the function returns degraded but non-empty output rather than throwing.
+Cross-reference: the OpenCode session reader no longer demonstrates this pattern — it ships zero native code and parses SQLite with the pure-TS `core/mem/internal/sqlite-readonly.ts`, which is the preferred outcome. The soft-degrade pattern above is the fallback for a future native dep that genuinely cannot be eliminated; when its native reader is unavailable, the load site returns degraded but non-empty output rather than throwing.
 
 #### 3. Test on Windows + restricted network before shipping
 

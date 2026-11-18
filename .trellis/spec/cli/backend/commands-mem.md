@@ -68,7 +68,6 @@ invoked from the `tl` Commander wire.
 - `runMem`, argv parsing (`parseArgv`), and CLI flag → `MemFilter` translation
 - terminal rendering: `printSessions`, `shortDate`, `shortPath`, row formatting
 - `--json` output shaping (preserving the stable JSON field names)
-- the OpenCode-unavailable stderr notice (`warnOpencodeUnavailable`)
 - `process.exit` codes and `die`
 
 The CLI imports core through the public subpath only:
@@ -122,7 +121,7 @@ Subcommand-specific:
 | `--turns N`          | `context`            | `3`                   | Number of hit turns to surface.                                                                                                                                    |
 | `--around M`         | `context`            | `1`                   | Turns of context on either side of each hit; deduped via `Set`.                                                                                                    |
 | `--max-chars N`      | `context`            | `6000` (~1500 tokens) | Total char budget. Per-turn cap is `floor(N/2)`; turns exceeding it are head-truncated with `…[+X chars]`.                                                         |
-| `--include-children` | `search`, `context`  | off                   | Merge OpenCode sub-agent descendants into parent before search/context (only OpenCode populates `parent_id`). No-op in 0.6.0-beta.4 (OpenCode reader unavailable). |
+| `--include-children` | `search`, `context`  | off                   | Merge OpenCode sub-agent descendants into parent before search/context (only OpenCode populates `parent_id`).                                                              |
 | `--json`             | all                  | off                   | Machine-readable output for AI consumption.                                                                                                                        |
 
 ---
@@ -137,7 +136,7 @@ three functions:
 | Claude   | `core/mem/adapters/claude.ts:claudeListSessions`     | `claudeExtractDialogue`   | `claudeSearch`                                    |
 | Codex    | `core/mem/adapters/codex.ts:codexListSessions`       | `codexExtractDialogue`    | `codexSearch`                                     |
 | Devin    | `core/mem/adapters/devin.ts:devinListSessions`       | `devinExtractDialogue`    | `devinSearch`                                     |
-| OpenCode | `core/mem/adapters/opencode.ts:opencodeListSessions` | `opencodeExtractDialogue` | `opencodeSearch` (degraded no-op in 0.6.0-beta.4) |
+| OpenCode | `core/mem/adapters/opencode.ts:opencodeListSessions` | `opencodeExtractDialogue` | `opencodeSearch`                                  |
 | Pi       | `core/mem/adapters/pi.ts:piListSessions`             | `piExtractDialogue`       | `piSearch`                                        |
 | ZCode    | `core/mem/adapters/zcode.ts:zcodeListSessions`       | `zcodeExtractDialogue`    | `zcodeSearch`                                     |
 
@@ -333,41 +332,51 @@ zero-dependency parser as ZCode / OpenCode. This is **not** `trellis init
 - **Out of v1**: Devin Cloud, Desktop Cascade, `transcripts/*.json`,
   `--include-children` (local `subagent_heads` is unused).
 
-### OpenCode (reader unavailable as of 0.6.0-beta.4+)
+### OpenCode (v1 + v2 dual schema)
 
-In 0.6.0-beta.3 a SQLite-backed reader was added for OpenCode 1.2+
-(which migrated from JSON tree to `~/.local/share/opencode/opencode.db`).
-That release relied on a `better-sqlite3` native dependency that broke
-installation on Windows + restricted networks (China, corporate
-firewalls): `prebuild-install` timed out fetching binaries, the fallback
-`node-gyp` rebuild required VS2017+ build tools, and `trellis` failed to
-install at all on machines that did not have a C toolchain. 0.6.0-beta.4
-reverted the dependency. See `quality-guidelines.md` "Native dependency
-policy" for the broader rule.
+OpenCode stores sessions in a WAL-mode SQLite database at
+`~/.local/share/opencode/opencode.db`. Two schema generations share that one
+file; which one is live is detected by table presence in `sqlite_master`:
 
-Current behavior:
+- **v1 (OpenCode 1.x)**: `session` / `message` / `part` tables. Session rows
+  carry `parent_id` (sub-agent chain), `title`, `directory` (workspace cwd),
+  `time_created` / `time_updated`; message `data` JSON holds `{role, ...}`;
+  part `data` JSON holds `{type: "text"|"tool"|"reasoning"|..., ...}`.
+- **v2 (OpenCode 2.x)**: `session_v2` / `session_message` / `session_part`.
+  `session_message.type` is a discriminated union (`user` / `assistant` /
+  `compaction` / `system` / `synthetic` / `skill` / `shell` / …); user text
+  lives in `data.text`, assistant text in `data.content[]` elements of type
+  `"text"`, and completed compactions carry `data.summary`. Ordering uses
+  the `(session_id, seq)` unique index rather than `time_created`.
+  `session_part` (keyed `(message_id, ordinal)`) is a redundant expansion of
+  assistant `content[]` and is not read.
 
-- `opencodeListSessions` returns `[]`.
-- `opencodeExtractDialogue` returns `[]`.
-- `opencodeSearch` returns an empty hit.
-- All three call `warnOpencodeUnavailable()` which writes one stderr line
-  per process (cached via module-level flag).
+**Migration co-existence**: a v1→v2 import records its phase in the `kv`
+table. Until the phase is `completed` the v1 tables may still hold sessions
+the importer has not copied, so both generations are read and de-duplicated
+by session id (the v2 copy wins). A missing `kv` table or key is treated
+conservatively as "possibly incomplete". v1 tables remain readable after
+migration, so pre-upgrade history stays visible.
 
-Re-enabling OpenCode requires an install-resilient backend. Acceptable
-options, ordered by preference:
+SQLite access goes through the zero-dependency parser in
+`internal/sqlite-readonly.ts` (the same one ZCode and Devin use): the
+database is snapshotted and parsed read-only — never opened for write,
+locked, checkpointed, or copied over. A `better-sqlite3`-backed reader
+shipped in 0.6.0-beta.3 and was reverted one release later because its
+prebuild download + node-gyp fallback broke `npm install` on Windows and
+restricted networks; the adapter was later rebuilt on the pure-TS parser.
+No native module, WASM blob, system `sqlite3`, or install-time build step
+may come back with this adapter — see `quality-guidelines.md` "Native
+dependency policy".
 
-1. **Pure-JS / WASM** — `sql.js` bundled WASM. No native build, identical
-   bytes on every platform, slightly higher memory cost.
-2. **Shell-out** — invoke the user's system `sqlite3` CLI when present;
-   skip OpenCode with a clear message when absent. No native build, zero
-   bundle cost, depends on host.
-3. **`node:sqlite`** — once it graduates from experimental in Node LTS.
-   Native but ships with the runtime, no install-time compile.
-4. **`optionalDependencies` + soft-degrade** — only as a last resort, and
-   only if the soft-degrade path matches today's "empty list + one-shot
-   warning" UX exactly so a missing dep does not regress install reliability.
-
-See follow-up task notes.
+- **Sub-agent linkage**: `parent_id` on `session` / `session_v2` feeds
+  `--include-children`; sessions from every project share the single
+  database and are scoped by `directory`.
+- **Degradation**: missing db → no sessions. Corrupt / unstable /
+  schema-mismatched db → empty output plus one structured
+  `opencode-db-unreadable` / `opencode-db-snapshot-unstable` /
+  `opencode-db-schema-unsupported` warning; core never prints it (same
+  contract as ZCode / Devin).
 
 ### `SessionInfo` contract
 
@@ -381,9 +390,9 @@ Every list function emits items conforming to the `MemSessionInfo` type
 | `title`     | optional      | Claude index `title`, OpenCode `title`, Devin `sessions.title`, Pi latest `session_info.name`; Codex has no title                                       |
 | `cwd`       | optional      | OpenCode `directory`, Claude index/event `cwd`, Codex first-event `payload.cwd`, Pi session header `cwd`, Devin `working_directory`                     |
 | `created`   | optional ISO  | first-event/header timestamp; Codex falls back to filename timestamp                                                                                    |
-| `updated`   | optional ISO  | `fs.statSync(file).mtime` for Claude/Codex fallback; Pi prefers latest user/assistant activity and falls back to mtime; OpenCode `session.time_updated` |
+| `updated`   | optional ISO  | `fs.statSync(file).mtime` for Claude/Codex fallback; Pi prefers latest user/assistant activity and falls back to mtime; OpenCode `time_updated` (`session` / `session_v2`) |
 | `filePath`  | yes           | absolute path to the session's primary file (OpenCode: shared `opencode.db`)                                                                            |
-| `parent_id` | OpenCode only | sub-agent linkage from `session.parent_id`; Pi `parentSession` is fork/clone source metadata and must not participate in `--include-children`           |
+| `parent_id` | OpenCode only | sub-agent linkage from `session.parent_id` / `session_v2.parent_id`; Pi `parentSession` is fork/clone source metadata and must not participate in `--include-children`           |
 
 ---
 
@@ -568,8 +577,6 @@ never absorb children.
 - **No write path**: `mem` never modifies session files, indexes, or any other
   state. It is a strict reader.
 - **No remote/cloud sync**: OpenCode's optional cloud sync is invisible here.
-  Local OpenCode reading is also unavailable in 0.6.0-beta.4 (reverted — see
-  the OpenCode section above).
 - **No transitive dependency on Trellis runtime**: `core/mem/` does not import
   from `configurators/`, `migrations/`, `templates/`, or `.trellis/scripts`,
   and does not depend on the CLI package. It uses only
@@ -812,7 +819,7 @@ machine-readable stdout used by `--json` consumers.
 | Pi       | Native — boundary detection on assistant `toolCall` blocks named `bash` / `shell` and `bashExecution.command` messages on the active branch |
 | ZCode    | Native — boundary detection on `part.data` Bash tool records after compaction has selected the effective dialogue                         |
 | Devin    | Native — `exec` tool_calls' `arguments.command`                                                                                            |
-| OpenCode | Reader unavailable in 0.6.0-beta.4+ (returns empty + warning)                                                                               |
+| OpenCode | Not yet — list/extract/search fully work (v1 + v2 schemas), but no `task.py` boundary collector exists; `--phase` returns the full dialogue plus an `opencode-phase-unsupported` warning |
 
 `core/mem/adapters/codex.ts:collectCodexTurnsAndEvents` is the Codex twin of
 `collectClaudeTurnsAndEvents`. Same single-pass shape: it produces both the
@@ -825,8 +832,9 @@ and whose argument payload contains `task.py create|start`. The dispatcher in
 matrix above are shared across Claude, Codex, and Pi — only the raw-event
 parser differs.
 
-OpenCode is the only outstanding gap and is gated on the OpenCode reader
-itself; see "OpenCode reader status" below.
+OpenCode is the only outstanding gap: the reader itself works, but no
+raw-pass collector maps its tool records to `task.py` boundaries yet
+(`MEM_PLATFORMS.opencode.phaseSupported === false`).
 
 ### Combining with `--grep`
 

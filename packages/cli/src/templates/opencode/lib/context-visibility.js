@@ -1,132 +1,94 @@
-import { createHash } from "node:crypto"
+/**
+ * OpenCode v2 message-shaping helpers for the `context` session hook.
+ *
+ * v2 hook messages (`SessionRequestMessage = Message & { metadata? }` from
+ * `@opencode/plugin/promise/session`) are flat objects:
+ *
+ *   { id?, role: "user" | "assistant" | "system" | "tool", content: Part[], metadata? }
+ *
+ * and text parts are `{ type: "text", text, cache?, providerMetadata? }`.
+ * Unlike the v1 `experimental.chat.messages.transform` payload, part objects
+ * carry no persisted identity (no `prt_` ids, no `sessionID` / `messageID`
+ * fields), so the v1 persisted-part machinery (synthetic part id derivation)
+ * has no v2 counterpart and was removed.
+ *
+ * [v2-verify] Shapes confirmed against @opencode/plugin@2.3.2
+ * (dist/promise/session.d.ts) and @opencode/ai@2.3.2
+ * (dist/schema/messages.d.ts). `metadata` is documented as the stored Session
+ * message's metadata — read-only for the model call and NOT sent to the
+ * model — so ephemeral-injection bookkeeping lives there.
+ */
 
-const PART_ID_PATTERN = /^prt_([0-9a-f]{12})[0-9A-Za-z]{14}$/
-const CONTEXT_PART_KINDS = {
-  sessionStart: { offset: 2n, slot: "0" },
-  workflowState: { offset: 1n, slot: "1" },
+const TRELLIS_METADATA_KEY = "trellis"
+const EPHEMERAL_PARTS_KEY = "ephemeralParts"
+
+function trellisMetadata(message) {
+  const metadata = message?.metadata
+  if (!metadata || typeof metadata !== "object") return {}
+  const trellis = metadata[TRELLIS_METADATA_KEY]
+  return trellis && typeof trellis === "object" ? trellis : {}
 }
-const MAX_CONTEXT_PART_OFFSET = Object.values(CONTEXT_PART_KINDS).reduce(
-  (maximum, definition) => definition.offset > maximum ? definition.offset : maximum,
-  0n,
-)
 
 /**
- * Return the first ordinary user-authored text part.
+ * Number of leading text parts that were ephemerally injected by Trellis
+ * plugins. Each `prependEphemeralText` call unshifts one part and bumps this
+ * counter, so the synthetic parts are always the first N text parts.
+ */
+function ephemeralPartCount(message) {
+  const count = trellisMetadata(message)[EPHEMERAL_PARTS_KEY]
+  return Number.isInteger(count) && count > 0 ? count : 0
+}
+
+/**
+ * Return the first ordinary user-authored text part of a v2 message.
  *
  * Trellis plugins can run in either order, so callers must not mistake a
- * synthetic context part inserted by another plugin for the user's prompt.
+ * synthetic context part injected by another plugin for the user's prompt.
  */
-export function findUserTextPart(parts) {
-  if (!Array.isArray(parts)) return undefined
-  return parts.find(
-    part => part?.type === "text" && part.synthetic !== true && part.text !== undefined,
-  )
-}
-
-function findIdentitySourcePart(parts) {
-  return parts
-    .filter(
-      part =>
-        part?.synthetic !== true &&
-        typeof part?.id === "string" &&
-        typeof part?.sessionID === "string" &&
-        typeof part?.messageID === "string" &&
-        PART_ID_PATTERN.test(part.id),
-    )
-    .sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0))[0]
-}
-
-function contextPartId(source, kind) {
-  const definition = CONTEXT_PART_KINDS[kind]
-  if (!definition) throw new TypeError(`unknown context part kind: ${kind}`)
-
-  const match = PART_ID_PATTERN.exec(source.id)
-  if (!match) throw new TypeError(`unsupported OpenCode part ID: ${source.id}`)
-  const sourceOrdinal = BigInt(`0x${match[1]}`)
-  if (sourceOrdinal <= MAX_CONTEXT_PART_OFFSET) {
-    throw new TypeError(`unsupported OpenCode part ID ordinal: ${source.id}`)
+export function findUserTextPart(message) {
+  const content = message?.content
+  if (!Array.isArray(content)) return undefined
+  let skip = ephemeralPartCount(message)
+  for (const part of content) {
+    if (part?.type !== "text" || typeof part.text !== "string") continue
+    if (skip > 0) {
+      skip -= 1
+      continue
+    }
+    return part
   }
-  const ordinal = sourceOrdinal - definition.offset
-  const suffix = createHash("sha256")
-    .update(`${source.messageID}\0${kind}`)
-    .digest("hex")
-    .slice(0, 13)
-  return `prt_${ordinal.toString(16).padStart(12, "0")}${definition.slot}${suffix}`
+  return undefined
 }
 
 /**
- * Persist machine-authored context ahead of the ordinary user parts without
- * mutating any existing part. The generated identity sorts before the source
- * user part in the same order during both the first request and stored replay.
- */
-export function insertSyntheticTextPart(parts, text, kind) {
-  if (!Array.isArray(parts)) throw new TypeError("parts must be an array")
-  if (typeof text !== "string") throw new TypeError("text must be a string")
-  if (!CONTEXT_PART_KINDS[kind]) throw new TypeError(`unknown context part kind: ${kind}`)
-
-  const source = findIdentitySourcePart(parts)
-  if (!source) throw new TypeError("no ordinary OpenCode part with a persisted identity")
-
-  const id = contextPartId(source, kind)
-  if (parts.some(part => part?.id === id)) {
-    throw new TypeError(`duplicate synthetic context part: ${kind}`)
-  }
-  const part = {
-    id,
-    sessionID: source.sessionID,
-    messageID: source.messageID,
-    type: "text",
-    text,
-    synthetic: true,
-  }
-  const insertionIndex = parts.findIndex(existing => typeof existing?.id !== "string" || id < existing.id)
-  if (insertionIndex === -1) parts.push(part)
-  else parts.splice(insertionIndex, 0, part)
-  return part
-}
-
-/** OpenCode hook that mutates the in-memory model payload, not stored history. */
-export const MESSAGES_TRANSFORM_HOOK = "experimental.chat.messages.transform"
-
-/**
- * Index of the last user message in an OpenCode `{info, parts}[]` transcript.
- * Compaction and prompt both pass that shape to messages.transform.
+ * Index of the last user message in a v2 `context` hook `messages` array.
  */
 export function findLatestUserMessageIndex(messages) {
   if (!Array.isArray(messages)) return -1
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i]?.info?.role === "user") return i
+    if (messages[i]?.role === "user") return i
   }
   return -1
-}
-
-export function platformInputFromMessages(messages) {
-  const index = findLatestUserMessageIndex(messages)
-  if (index < 0) return null
-  const info = messages[index].info
-  if (!info || typeof info !== "object") return null
-  return {
-    sessionID: info.sessionID,
-    agent: info.agent,
-  }
 }
 
 export function latestUserPromptText(messages) {
   const index = findLatestUserMessageIndex(messages)
   if (index < 0) return ""
-  const part = findUserTextPart(messages[index].parts)
+  const part = findUserTextPart(messages[index])
   return typeof part?.text === "string" ? part.text : ""
 }
 
 export function transcriptHasAssistantMessage(messages) {
   if (!Array.isArray(messages)) return false
-  return messages.some(message => message?.info?.role === "assistant")
+  return messages.some(message => message?.role === "assistant")
 }
 
 /**
  * Clone the latest user message and prepend an ephemeral synthetic text
- * part. The original message object and its `parts` array are left
- * untouched so a transform cannot leak into OpenCode's stored history.
+ * part. The original message object and its `content` array are left
+ * untouched; the v2 `context` hook only affects the outgoing model call,
+ * and cloning additionally keeps each plugin's view of earlier parts stable
+ * when multiple Trellis plugins run on the same event.
  */
 export function prependEphemeralText(messages, text) {
   if (!Array.isArray(messages)) return false
@@ -134,15 +96,26 @@ export function prependEphemeralText(messages, text) {
   const index = findLatestUserMessageIndex(messages)
   if (index < 0) return false
   const original = messages[index]
-  const parts = Array.isArray(original.parts) ? original.parts.slice() : []
-  parts.unshift({
-    type: "text",
-    text,
-    synthetic: true,
-  })
+  const content = Array.isArray(original.content) ? original.content.slice() : []
+  content.unshift({ type: "text", text })
+
+  const priorMetadata =
+    original.metadata && typeof original.metadata === "object" ? original.metadata : {}
+  const priorTrellis = trellisMetadata(original)
+  // [v2-verify] Replacing the array element with a plain-object copy relies
+  // on the hook re-reading `event.messages` after mutation (the documented
+  // mutation channel); SessionRequestMessage is a structural type, so a
+  // spread copy carries every field the runtime sends on.
   messages[index] = {
     ...original,
-    parts,
+    content,
+    metadata: {
+      ...priorMetadata,
+      [TRELLIS_METADATA_KEY]: {
+        ...priorTrellis,
+        [EPHEMERAL_PARTS_KEY]: ephemeralPartCount(original) + 1,
+      },
+    },
   }
   return true
 }

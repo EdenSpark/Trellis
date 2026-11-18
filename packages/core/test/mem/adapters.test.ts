@@ -2019,6 +2019,425 @@ describe.skipIf(!SQLITE_PY)("opencode adapter", () => {
 });
 
 // =============================================================================
+// OpenCode adapter — v2 schema (`session_v2` / `session_message` / `kv`).
+// OpenCode 2.x keeps the same `opencode.db` file but writes new tables; the
+// v1 tables are left behind by the migration. Detection is by table presence,
+// and while the kv migration marker is unfinished both generations are read
+// and de-duplicated by session id (the v2 copy wins).
+// =============================================================================
+
+interface OpencodeV2Fixture {
+  sessions?: {
+    id: string;
+    parent_id?: string | null;
+    title?: string;
+    directory?: string;
+    time_created?: number;
+    time_updated?: number;
+  }[];
+  messages?: {
+    id: string;
+    session_id: string;
+    type: string;
+    /** Per-session order; rows may be inserted out of order to prove the
+     * adapter sorts by `seq`, not by rowid. */
+    seq: number;
+    data: Record<string, unknown>;
+    /** Raw text written verbatim into `data`, bypassing JSON encoding. */
+    rawData?: string;
+  }[];
+  /** Coexisting v1 rows (the migration leaves the old tables intact). */
+  v1?: {
+    sessions?: OpencodeFixture["sessions"];
+    messages?: OpencodeFixture["messages"];
+    parts?: OpencodeFixture["parts"];
+  };
+  /** Value of the kv migration marker's `phase`; the `kv` table and marker
+   * row are created only when this is set. Omit to model "no marker". */
+  migrationPhase?: string;
+  dbPath?: string;
+}
+
+/** Build an OpenCode 2.x-shaped SQLite db, optionally with the leftover v1
+ * tables and the kv migration marker. */
+function buildOpencodeV2Db(spec: OpencodeV2Fixture): void {
+  const dbPath = spec.dbPath ?? OPENCODE_DB;
+  nodeFs.mkdirSync(nodePath.dirname(dbPath), { recursive: true });
+  runPython(`
+import sqlite3, json, os
+db_path = ${JSON.stringify(dbPath)}
+for suffix in ("", "-wal", "-shm"):
+    if os.path.exists(db_path + suffix):
+        os.remove(db_path + suffix)
+db = sqlite3.connect(db_path)
+db.execute("CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER)")
+db.execute("CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, seq INTEGER, time_created INTEGER, time_updated INTEGER, data TEXT)")
+spec = json.loads(${JSON.stringify(JSON.stringify(spec))})
+phase = spec.get("migrationPhase")
+if phase is not None:
+    db.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)")
+    db.execute("INSERT INTO kv (key, value) VALUES (?, ?)",
+               ("migration.v1-v2", json.dumps({"phase": phase})))
+v1 = spec.get("v1")
+if v1 is not None:
+    db.execute("CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, title TEXT, directory TEXT, time_created INTEGER, time_updated INTEGER)")
+    db.execute("CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, time_updated INTEGER, data TEXT)")
+    db.execute("CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT)")
+    v1_message_sessions = {m["id"]: m["session_id"] for m in v1.get("messages", [])}
+    for s in v1.get("sessions", []):
+        db.execute(
+            "INSERT INTO session (id,parent_id,title,directory,time_created,time_updated) VALUES (?,?,?,?,?,?)",
+            (s["id"], s.get("parent_id"), s.get("title"), s.get("directory"),
+             s.get("time_created", 1000), s.get("time_updated", 2000)))
+    for m in v1.get("messages", []):
+        db.execute(
+            "INSERT INTO message (id,session_id,time_created,time_updated,data) VALUES (?,?,?,?,?)",
+            (m["id"], m["session_id"], m["time_created"], m["time_created"],
+             json.dumps({"role": m["role"]})))
+    for i, p in enumerate(v1.get("parts", [])):
+        session_id = p.get("session_id") or v1_message_sessions.get(p["message_id"], "")
+        db.execute("INSERT INTO part (id,message_id,session_id,time_created,data) VALUES (?,?,?,?,?)",
+                   (f"prt_{i}", p["message_id"], session_id, p["time_created"],
+                    json.dumps(p["data"])))
+for s in spec.get("sessions", []):
+    db.execute(
+        "INSERT INTO session_v2 (id,project_id,parent_id,directory,title,time_created,time_updated) VALUES (?,?,?,?,?,?,?)",
+        (s["id"], "proj_global", s.get("parent_id"), s.get("directory"),
+         s.get("title"), s.get("time_created", 1000), s.get("time_updated", 2000)))
+for m in spec.get("messages", []):
+    data = m["rawData"] if "rawData" in m else json.dumps(m["data"])
+    db.execute(
+        "INSERT INTO session_message (id,session_id,type,seq,time_created,time_updated,data) VALUES (?,?,?,?,?,?,?)",
+        (m["id"], m["session_id"], m["type"], m["seq"], m["seq"], m["seq"], data))
+db.commit()
+db.close()
+`);
+}
+
+describe.skipIf(!SQLITE_PY)("opencode adapter — v2 schema", () => {
+  const savedEnv = {
+    XDG_DATA_HOME: process.env.XDG_DATA_HOME,
+    OPENCODE_DB: process.env.OPENCODE_DB,
+  };
+
+  beforeEach(() => {
+    delete process.env.XDG_DATA_HOME;
+    delete process.env.OPENCODE_DB;
+    rimrafOpencodeDb();
+  });
+
+  afterEach(() => {
+    releaseOpencodeSessionStore();
+    rimrafOpencodeDb();
+    if (savedEnv.XDG_DATA_HOME === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = savedEnv.XDG_DATA_HOME;
+    if (savedEnv.OPENCODE_DB === undefined) delete process.env.OPENCODE_DB;
+    else process.env.OPENCODE_DB = savedEnv.OPENCODE_DB;
+  });
+
+  // ---------- list ----------
+
+  it("lists v2 sessions and keeps the sub-agent parent link", () => {
+    buildOpencodeV2Db({
+      migrationPhase: "completed",
+      sessions: [
+        {
+          id: "ses_parent",
+          title: "parent chat",
+          directory: "/proj/a",
+          time_created: 1000,
+          time_updated: 2000,
+        },
+        {
+          id: "ses_child",
+          parent_id: "ses_parent",
+          title: "sub-agent run",
+          directory: "/proj/a",
+          time_created: 1500,
+          time_updated: 1800,
+        },
+      ],
+    });
+    const rows = opencodeListSessions(mkFilter({ cwd: undefined }));
+    expect(rows).toHaveLength(2);
+    expect(rows.find((r) => r.id === "ses_parent")).toEqual({
+      platform: "opencode",
+      id: "ses_parent",
+      title: "parent chat",
+      cwd: "/proj/a",
+      created: new Date(1000).toISOString(),
+      updated: new Date(2000).toISOString(),
+      filePath: OPENCODE_DB,
+    });
+    // parent_id survives so `--include-children` can merge sub-agent chains.
+    expect(rows.find((r) => r.id === "ses_child")?.parent_id).toBe(
+      "ses_parent",
+    );
+  });
+
+  it("filters v2 sessions by --cwd against session_v2.directory", () => {
+    buildOpencodeV2Db({
+      sessions: [
+        { id: "s1", directory: "/proj/a" },
+        { id: "s2", directory: "/proj/b" },
+      ],
+    });
+    expect(
+      opencodeListSessions(mkFilter({ cwd: "/proj/a" })).map((r) => r.id),
+    ).toEqual(["s1"]);
+  });
+
+  // ---------- extract ----------
+
+  it("extracts v2 turns ordered by seq, joining assistant text content", () => {
+    buildOpencodeV2Db({
+      sessions: [{ id: "s1", directory: "/p" }],
+      messages: [
+        // Inserted out of order: the adapter must sort by `seq`, not rowid.
+        {
+          id: "m2",
+          session_id: "s1",
+          type: "assistant",
+          seq: 2,
+          data: {
+            content: [
+              { type: "reasoning", text: "internal deliberation" },
+              { type: "text", text: "answer part one" },
+              {
+                type: "tool",
+                id: "call_1",
+                name: "bash",
+                state: { status: "completed", input: {}, content: "a\nb" },
+              },
+              { type: "text", text: "answer part two" },
+            ],
+          },
+        },
+        {
+          id: "m1",
+          session_id: "s1",
+          type: "user",
+          seq: 1,
+          data: { text: "why is the hook failing" },
+        },
+        {
+          id: "m3",
+          session_id: "s1",
+          type: "user",
+          seq: 3,
+          data: { text: "third <system-reminder>hidden noise</system-reminder>" },
+        },
+      ],
+    });
+    expect(opencodeExtractDialogue(ocSession("s1"))).toEqual([
+      { role: "user", text: "why is the hook failing" },
+      { role: "assistant", text: "answer part one\n\nanswer part two" },
+      { role: "user", text: "third" },
+    ]);
+  });
+
+  it("drops v2 bookkeeping message types from the dialogue", () => {
+    buildOpencodeV2Db({
+      sessions: [{ id: "s1", directory: "/p" }],
+      messages: [
+        { id: "m1", session_id: "s1", type: "system", seq: 1, data: { text: "instruction update" } },
+        { id: "m2", session_id: "s1", type: "synthetic", seq: 2, data: { text: "injected input" } },
+        { id: "m3", session_id: "s1", type: "skill", seq: 3, data: { skill: "x", name: "x", text: "skill text" } },
+        { id: "m4", session_id: "s1", type: "shell", seq: 4, data: { command: "ls", status: "done" } },
+        { id: "m5", session_id: "s1", type: "idle", seq: 5, data: { outcome: "succeeded" } },
+        { id: "m6", session_id: "s1", type: "agent-switched", seq: 6, data: { agent: "build" } },
+        { id: "m7", session_id: "s1", type: "user", seq: 7, data: { text: "real question" } },
+      ],
+    });
+    expect(opencodeExtractDialogue(ocSession("s1"))).toEqual([
+      { role: "user", text: "real question" },
+    ]);
+  });
+
+  it("renders a completed v2 compaction as a boundary marker, skipping a running one", () => {
+    buildOpencodeV2Db({
+      sessions: [{ id: "s1", directory: "/p" }],
+      messages: [
+        { id: "m1", session_id: "s1", type: "user", seq: 1, data: { text: "old-secret should survive" } },
+        { id: "m2", session_id: "s1", type: "compaction", seq: 2, data: { status: "running", reason: "auto" } },
+        {
+          id: "m3",
+          session_id: "s1",
+          type: "compaction",
+          seq: 3,
+          data: { status: "completed", reason: "auto", summary: "summary of earlier work" },
+        },
+        { id: "m4", session_id: "s1", type: "user", seq: 4, data: { text: "after compact" } },
+      ],
+    });
+    const session = ocSession("s1");
+    const turns = opencodeExtractDialogue(session);
+    expect(turns).toHaveLength(3);
+    expect(turns[0]).toEqual({ role: "user", text: "old-secret should survive" });
+    expect(turns[1]?.kind).toBe("marker");
+    expect(turns[1]?.text).toContain("[compaction boundary]");
+    expect(turns[1]?.text).toContain("summary of earlier work");
+    expect(turns[2]).toEqual({ role: "user", text: "after compact" });
+    // The summarized rows are still in the database, so recall finds them and
+    // the marker stays out of the search denominator.
+    expect(opencodeSearch(session, "old-secret").count).toBe(1);
+    expect(opencodeSearch(session, "old-secret").totalTurns).toBe(2);
+  });
+
+  it("skips v2 rows whose data JSON is malformed", () => {
+    buildOpencodeV2Db({
+      sessions: [{ id: "s1", directory: "/p" }],
+      messages: [
+        { id: "m1", session_id: "s1", type: "user", seq: 1, data: {}, rawData: "{not json" },
+        { id: "m2", session_id: "s1", type: "user", seq: 2, data: { text: "healthy row" } },
+      ],
+    });
+    expect(opencodeExtractDialogue(ocSession("s1")).map((t) => t.text)).toEqual([
+      "healthy row",
+    ]);
+  });
+
+  it("search counts v2 user/assistant occurrences", () => {
+    buildOpencodeV2Db({
+      sessions: [{ id: "s1", directory: "/p" }],
+      messages: [
+        { id: "m1", session_id: "s1", type: "user", seq: 1, data: { text: "find the hook bug" } },
+        {
+          id: "m2",
+          session_id: "s1",
+          type: "assistant",
+          seq: 2,
+          data: { content: [{ type: "text", text: "the hook is here" }] },
+        },
+      ],
+    });
+    const hit = opencodeSearch(ocSession("s1"), "hook");
+    expect(hit.count).toBeGreaterThanOrEqual(2);
+    expect(hit.userCount).toBe(1);
+    expect(hit.asstCount).toBe(1);
+  });
+
+  it("serves v2 sessions from a prepared search store and forgets it on release", () => {
+    buildOpencodeV2Db({
+      sessions: [{ id: "s1", directory: "/p" }],
+      messages: [
+        { id: "m1", session_id: "s1", type: "user", seq: 1, data: { text: "stored once" } },
+      ],
+    });
+    prepareOpencodeSessionStore(OPENCODE_DB);
+    // Deleting the file proves the prepared store, not a re-read, served this.
+    nodeFs.rmSync(OPENCODE_DB, { force: true });
+    expect(opencodeExtractDialogue(ocSession("s1")).map((t) => t.text)).toEqual(
+      ["stored once"],
+    );
+    releaseOpencodeSessionStore();
+    expect(opencodeExtractDialogue(ocSession("s1"))).toEqual([]);
+  });
+
+  // ---------- migration in progress: dual-read ----------
+
+  it("dual-reads v1 and v2 while the migration is incomplete, de-duplicating by id", () => {
+    buildOpencodeV2Db({
+      migrationPhase: "sessions",
+      sessions: [
+        { id: "ses_new", title: "only in v2", directory: "/proj/a" },
+        { id: "ses_shared", title: "v2 copy", directory: "/proj/a" },
+      ],
+      messages: [
+        { id: "m1", session_id: "ses_shared", type: "user", seq: 1, data: { text: "v2 turns win" } },
+      ],
+      v1: {
+        sessions: [
+          { id: "ses_old", title: "only in v1", directory: "/proj/a" },
+          { id: "ses_shared", title: "v1 copy", directory: "/proj/a" },
+        ],
+        messages: [
+          { id: "vm1", session_id: "ses_old", time_created: 10, role: "user" },
+          { id: "vm2", session_id: "ses_shared", time_created: 20, role: "user" },
+        ],
+        parts: [
+          { message_id: "vm1", time_created: 10, data: { type: "text", text: "unmigrated turns" } },
+          { message_id: "vm2", time_created: 20, data: { type: "text", text: "v1 duplicate" } },
+        ],
+      },
+    });
+    const rows = opencodeListSessions(mkFilter({ cwd: undefined }));
+    // No duplicated session ids across the two generations.
+    expect(rows.map((r) => r.id).sort()).toEqual([
+      "ses_new",
+      "ses_old",
+      "ses_shared",
+    ]);
+    // The v2 copy of a shared id wins.
+    expect(rows.find((r) => r.id === "ses_shared")?.title).toBe("v2 copy");
+    // A session only in the v1 tables still extracts (migration pending).
+    expect(
+      opencodeExtractDialogue(ocSession("ses_old")).map((t) => t.text),
+    ).toEqual(["unmigrated turns"]);
+    // A session in both reads v2 only — its turns are not doubled.
+    expect(
+      opencodeExtractDialogue(ocSession("ses_shared")).map((t) => t.text),
+    ).toEqual(["v2 turns win"]);
+  });
+
+  it("treats a missing kv marker as an incomplete migration", () => {
+    buildOpencodeV2Db({
+      // No migrationPhase: no kv table, no marker — read both generations.
+      sessions: [{ id: "ses_new", directory: "/proj/a" }],
+      v1: {
+        sessions: [{ id: "ses_old", directory: "/proj/a" }],
+      },
+    });
+    const ids = opencodeListSessions(mkFilter({ cwd: undefined }))
+      .map((r) => r.id)
+      .sort();
+    expect(ids).toEqual(["ses_new", "ses_old"]);
+  });
+
+  it("ignores the leftover v1 tables once the migration is completed", () => {
+    buildOpencodeV2Db({
+      migrationPhase: "completed",
+      sessions: [{ id: "ses_new", directory: "/proj/a" }],
+      messages: [
+        { id: "m1", session_id: "ses_new", type: "user", seq: 1, data: { text: "v2 only" } },
+      ],
+      v1: {
+        sessions: [{ id: "ses_old", directory: "/proj/a" }],
+        messages: [
+          { id: "vm1", session_id: "ses_old", time_created: 10, role: "user" },
+        ],
+        parts: [
+          { message_id: "vm1", time_created: 10, data: { type: "text", text: "already migrated" } },
+        ],
+      },
+    });
+    expect(
+      opencodeListSessions(mkFilter({ cwd: undefined })).map((r) => r.id),
+    ).toEqual(["ses_new"]);
+    expect(opencodeExtractDialogue(ocSession("ses_new")).map((t) => t.text)).toEqual(
+      ["v2 only"],
+    );
+    // Migrated-away v1 rows are not a fallback once the import is done.
+    expect(opencodeExtractDialogue(ocSession("ses_old"))).toEqual([]);
+  });
+
+  // ---------- degradation ----------
+
+  it("warns with opencode-db-schema-unsupported when session_v2 lacks columns", () => {
+    buildOpencodeV2Db({ sessions: [{ id: "s1", directory: "/p" }] });
+    runPython(
+      `import sqlite3\ndb = sqlite3.connect(${JSON.stringify(OPENCODE_DB)})\ndb.execute("ALTER TABLE session_v2 DROP COLUMN directory")\ndb.commit()\ndb.close()\n`,
+    );
+    const warnings: { code: string; message: string }[] = [];
+    expect(opencodeListSessions(mkFilter({ cwd: undefined }), warnings)).toEqual(
+      [],
+    );
+    expect(warnings[0]?.code).toBe("opencode-db-schema-unsupported");
+    expect(warnings[0]?.message).toContain("directory");
+  });
+});
+
+// =============================================================================
 // ZCode adapter — reads from `~/.zcode/cli/db/db.sqlite` via the zero-dependency
 // SQLite parser. Fixtures are built with the system python sqlite3 module; the
 // whole block is skipped when no python interpreter is available so CI without

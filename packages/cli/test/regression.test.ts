@@ -2175,7 +2175,7 @@ describe("regression: update only configured platforms (beta.16)", () => {
   // opencode plugins / agents / package.json never reached installed projects.
   // That was a bug, not a design choice. This test used to assert the bug;
   // now it asserts the fix.
-  it("[beta.8] collectPlatformTemplates returns Map for opencode (plugins + agents + lib + package.json + commands + skills)", () => {
+  it("[beta.8] collectPlatformTemplates returns Map for opencode (plugins + agents + lib + commands + skills)", () => {
     const result = collectPlatformTemplates("opencode");
     expect(result).toBeInstanceOf(Map);
     if (!result) throw new Error("unreachable");
@@ -2186,11 +2186,13 @@ describe("regression: update only configured platforms (beta.16)", () => {
     );
     expect(result.has(".opencode/plugins/session-start.js")).toBe(true);
     expect(result.has(".opencode/plugins/inject-workflow-state.js")).toBe(true);
-    // Plus agents, lib, package.json, at least one command, at least one skill
+    // Plus agents, lib, at least one command, at least one skill. The
+    // template ships no package.json: OpenCode v2 loads the plugin files
+    // directly and they only import Node built-ins + sibling lib/ modules.
     expect(result.has(".opencode/agents/trellis-implement.md")).toBe(true);
     expect(result.has(".opencode/lib/context-visibility.js")).toBe(true);
     expect(result.has(".opencode/lib/trellis-context.js")).toBe(true);
-    expect(result.has(".opencode/package.json")).toBe(true);
+    expect(result.has(".opencode/package.json")).toBe(false);
   });
 
   it("[beta.16] collectPlatformTemplates returns Map for platforms with tracking", () => {
@@ -10345,7 +10347,7 @@ describe("regression: research agent persists findings to task dir", () => {
     expect(data.prompt).toMatch(/PERSIST|persist/);
   });
 
-  it("opencode research.md grants write/edit permission and has persist instruction", () => {
+  it("opencode research.md grants edit permission and has persist instruction", () => {
     const content = fs.readFileSync(
       path.join(
         repoRoot,
@@ -10354,9 +10356,9 @@ describe("regression: research agent persists findings to task dir", () => {
       "utf-8",
     );
     const fm = content.split("---\n")[1] ?? "";
-    // OpenCode uses YAML permission block, not Claude-style `tools:` list
-    expect(fm).toMatch(/^\s*write:\s*allow\s*$/m);
-    expect(fm).toMatch(/^\s*edit:\s*allow\s*$/m);
+    // OpenCode v2 uses a permissions array; write/edit fold into the `edit`
+    // action (v1 `write`/`patch`/`edit` all map to it).
+    expect(fm).toMatch(/action:\s*edit,\s*resource:\s*"\*",\s*effect:\s*allow/);
     // Body must reference persist target and PERSIST keyword
     expect(content).toContain("{TASK_DIR}/research/");
     expect(content).toMatch(/PERSIST|[Pp]ersist/);
@@ -10400,14 +10402,14 @@ describe("regression: templates/markdown/spec contains only .md.txt files (0.5.0
 });
 
 describe("regression: opencode plugin files have only export default (#212)", () => {
-  // OpenCode 1.2.x plugin loader iterates `Object.entries(mod)` and invokes
-  // every export as a plugin factory. Named exports alongside the default get
-  // called with wrong args, the loader aborts, and the default factory
-  // silently never runs — no error surfaces to stderr or to the plugin's own
-  // debug log. dc2bea3 fixed session-start.js by extracting named exports to
-  // lib/session-utils.js. This test prevents regression: any future named
-  // export added directly to a `.opencode/plugins/*.js` file would silently
-  // break that plugin's hooks on user machines.
+  // The OpenCode plugin contract is exactly one default export per plugin
+  // file (v2: a plain `{ id, setup(ctx) }` definition object; the v1 loader
+  // additionally treated every named export as a plugin factory, so named
+  // exports broke loading silently — #212). dc2bea3 fixed session-start.js
+  // by extracting named exports to lib/session-utils.js. This test prevents
+  // regression: any future named export added directly to a
+  // `.opencode/plugins/*.js` file would silently break that plugin's hooks
+  // on user machines.
   const __dirname2 = path.dirname(fileURLToPath(import.meta.url));
   const repoRoot = path.resolve(__dirname2, "../../..");
   const pluginsDir = path.join(

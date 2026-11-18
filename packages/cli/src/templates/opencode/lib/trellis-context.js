@@ -69,9 +69,10 @@ function buildContextKey(platformName, kind, value) {
 const TRELLIS_SUBAGENT_RE = /^trellis-(implement|check|research)$/
 
 /**
- * Return true when the OpenCode `chat.message` input represents a Trellis
- * sub-agent turn. `input.agent` is set by OpenCode when a Task tool spawns a
- * child session with a custom agent (see `packages/opencode/src/tool/task.ts`).
+ * Return true when an OpenCode hook event represents a Trellis sub-agent
+ * turn. v2 hook events (`context` session hook, `tool execute.before`,
+ * `shell create.before`) carry a readonly `agent` field directly — the Task
+ * tool spawns child sessions with the custom agent id.
  */
 export function isTrellisSubagent(input) {
   if (!input || typeof input !== "object") return false

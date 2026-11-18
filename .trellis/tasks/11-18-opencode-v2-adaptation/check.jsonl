@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/cli/backend/quality-guidelines.md", "reason": "质量门规范"}
+{"file": ".trellis/spec/cli/backend/error-handling.md", "reason": "插件与适配器错误处理规范（静默降级、不阻断）"}
+{"file": ".trellis/spec/cli/backend/workflow-state-contract.md", "reason": "inject-workflow-state 插件解析 workflow.md 的运行时契约，v2 重写后必须保持"}
+{"file": ".trellis/tasks/11-18-opencode-v2-adaptation/research/opencode-v2-plugin-api.md", "reason": "check 时核对插件行为与 v2 API 事实一致"}
+{"file": ".trellis/tasks/11-18-opencode-v2-adaptation/research/opencode-v2-session-storage.md", "reason": "check 时核对 mem 适配器与 v2 schema 事实一致"}

@@ -315,7 +315,7 @@ Every non-trivial run creates `.trellis/.backup-<timestamp>/`. `BACKUP_EXCLUDE_P
 
 ### `node_modules/` under managed dirs
 
-OpenCode's plugin pattern installs npm dependencies under `.opencode/`. Without `/node_modules/` in `BACKUP_EXCLUDE_PATTERNS`, every backup would snapshot the entire dependency tree (`update.integration.test.ts > #27 backup skips managed node_modules dependency trees` regression-tests this). When adding a new platform that ships dependencies, verify the pattern still catches them; if the platform uses a non-standard path, extend `BACKUP_EXCLUDE_PATTERNS`.
+OpenCode's v1 plugin pattern installed npm dependencies under `.opencode/`; v2 templates ship no `package.json` (OpenCode v2 does not read it), so this is now a legacy-install and user-content guard rather than a Trellis-installed tree. Without `/node_modules/` in `BACKUP_EXCLUDE_PATTERNS`, every backup would snapshot the entire dependency tree (`update.integration.test.ts > #27 backup skips managed node_modules dependency trees` regression-tests this). When adding a new platform that ships dependencies, verify the pattern still catches them; if the platform uses a non-standard path, extend `BACKUP_EXCLUDE_PATTERNS`.
 
 ### `.developer` raw-trim foot-gun
 

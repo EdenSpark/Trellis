@@ -3,15 +3,19 @@
  * Trellis Session Start Plugin
  *
  * Injects compact SessionStart context into the copy of the latest user
- * message that OpenCode sends to the model. Uses
- * `experimental.chat.messages.transform` so TUI / Web / SQLite history
- * stay untouched (issue #553).
+ * message that OpenCode sends to the model. Registered on the v2
+ * `context` session hook, whose changes affect only the outgoing model
+ * call — TUI / Web / SQLite history stay untouched (issue #553).
+ *
+ * OpenCode v2 plugin shape: default-export `{ id, async setup(ctx) }`.
+ * Deliberately does NOT import `@opencode/plugin` — the shipped template
+ * has no package.json / node_modules, so a bare import would fail to
+ * resolve. `Plugin.define` is only a typing helper; the runtime accepts a
+ * plain definition object.
  */
 
 import { TrellisContext, debugLog, isTrellisSubagent } from "../lib/trellis-context.js"
 import {
-  MESSAGES_TRANSFORM_HOOK,
-  platformInputFromMessages,
   prependEphemeralText,
   transcriptHasAssistantMessage,
 } from "../lib/context-visibility.js"
@@ -23,20 +27,19 @@ function stripFirstReplyNotice(context) {
   return context.replace(FIRST_REPLY_NOTICE_RE, "")
 }
 
-// OpenCode 1.2.x expects plugins to be factory functions (see inject-subagent-context.js comment).
-export default async ({ directory }) => {
-  const ctx = new TrellisContext(directory)
-  debugLog("session", "Plugin loaded, directory:", directory)
+export default {
+  id: "trellis.session-start",
+  async setup(ctx) {
+    const directory = ctx.location.directory
+    const trellis = new TrellisContext(directory)
+    debugLog("session", "Plugin loaded, directory:", directory)
 
-  return {
-    [MESSAGES_TRANSFORM_HOOK]: async (_input, output) => {
+    const registration = await ctx.session.hook("context", async (event) => {
       try {
-        const messages = output?.messages
-        const platformInput = platformInputFromMessages(messages)
-        const agent = platformInput?.agent || "unknown"
-        debugLog("session", "messages.transform called, agent:", agent)
+        const agent = event.agent || "unknown"
+        debugLog("session", "context hook called, agent:", agent)
 
-        if (isTrellisSubagent(platformInput)) {
+        if (isTrellisSubagent(event)) {
           debugLog("session", "Skipping trellis subagent turn:", agent)
           return
         }
@@ -51,15 +54,18 @@ export default async ({ directory }) => {
           return
         }
 
-        let context = buildSessionContext(ctx, platformInput)
-        if (transcriptHasAssistantMessage(messages)) {
+        const platformInput = { sessionID: event.sessionID, agent: event.agent }
+        let context = buildSessionContext(trellis, platformInput)
+        if (transcriptHasAssistantMessage(event.messages)) {
           context = stripFirstReplyNotice(context)
         }
         debugLog("session", "Built context, length:", context.length)
-        prependEphemeralText(messages, context)
+        prependEphemeralText(event.messages, context)
       } catch (error) {
-        debugLog("session", "Error in messages.transform:", error.message, error.stack)
+        debugLog("session", "Error in context hook:", error.message, error.stack)
       }
-    },
-  }
+    })
+
+    return () => registration.dispose()
+  },
 }
